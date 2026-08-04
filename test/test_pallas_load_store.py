@@ -65,9 +65,28 @@ def jagged_dense_bmm_2d_loop(
             out[st, kt] = acc
     return out
 
+@helion.kernel(backend="pallas")
+def jagged_dense_bmm_2d_loop_offset(
+    seq_offsets: torch.Tensor, jagged: torch.Tensor, dense: torch.Tensor
+) -> torch.Tensor:
+    L, D = jagged.shape
+    B, D, K = dense.shape
+    out = torch.empty((L, K), dtype=jagged.dtype, device=jagged.device)
+    for g in hl.grid(B):
+        s_start = seq_offsets[g]
+        s_end = seq_offsets[g + 1]
+        s_num = s_end - s_start
+        for st, kt in hl.tile([s_num, K]):
+            acc = hl.zeros([st, kt], dtype=torch.float32)
+            for dt in hl.tile(0, D):
+                acc = acc + torch.matmul(jagged[s_start + st.index, dt], dense[g, dt, kt])
+            out[s_start + st.index, kt] = acc
+    return out
+
 _BMM_KERNELS = [
     jagged_dense_bmm,
     jagged_dense_bmm_2d_loop,
+    jagged_dense_bmm_2d_loop_offset,
 ]
 
 def _ref_jagged_bmm(
