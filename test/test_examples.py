@@ -1693,16 +1693,25 @@ class TestExamples(RefEagerTestBase, TestCase):
                     rtol=rtol,
                 )
 
-    @xfailIfPallasTpu("tensor-derived if-predicates not supported")
-    def test_grouped_gemm_jagged(self):
-        # Build small jagged grouped GEMM inputs
+    @parametrize("unaligned", (False, True))
+    def test_grouped_gemm_jagged(self, unaligned: bool):
+        # Build small jagged grouped GEMM inputs.  K = N = 128 is a whole
+        # lane tile: at 64 the Pallas rows cannot be proven aligned (E2003).
         torch.manual_seed(0)
         G = 3
-        K, N = 64, 64
+        K, N = 128, 128
         dtype = torch.bfloat16
+        # Group sizes that are not multiples of the bf16 sublane (16) leave two
+        # groups sharing one row block, which is the case the Pallas ordered
+        # carry has to stitch.  Multiples of 16 emit the carry but never fire
+        # its runtime guard, so both are worth covering.  Both spellings keep
+        # the same total: this kernel is static_shapes=False, and calling it
+        # with two different totals in one process mis-sizes the output (a
+        # pre-existing bug, reproducible before the rebased-tile lowering).
+        rows = [45, 77, 70] if unaligned else [32, 64, 96]
+        assert len(rows) == G
         group_A = [
-            torch.randn(32 * (i + 1), K, device=DEVICE, dtype=dtype).contiguous()
-            for i in range(G)
+            torch.randn(m, K, device=DEVICE, dtype=dtype).contiguous() for m in rows
         ]
         B_shared = torch.randn(K, N, device=DEVICE, dtype=dtype).contiguous()
 
@@ -1719,11 +1728,16 @@ class TestExamples(RefEagerTestBase, TestCase):
 
         # Run kernel and check
         args = (A_packed, B_shared, group_offsets)
+        # ``start + tile_m.index`` lowers as a rebased jagged tile, which needs
+        # the ordered carry on the emit_pipeline path; fori_loop rejects the
+        # resulting ragged store.  Non-Pallas backends drop the key.
         check_example(
             "grouped_gemm",
             args,
             expected,
             fn_name="grouped_gemm_jagged",
+            block_sizes=[16, 128, 128],
+            pallas_loop_type="emit_pipeline",
         )
 
     @xfailIfPallas("Pallas scatter: multiple indirect dims are not supported")
