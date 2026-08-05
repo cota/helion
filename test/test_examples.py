@@ -1217,21 +1217,23 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     def test_long_sum_manual_non_divisible(self):
-        """Reduction loop OOB when block_size doesn't divide the reduction dim.
+        """Dynamic reduction widths must refresh the Pallas launcher cache.
 
         longsum_manual uses dynamic shapes (static_shapes=False by default).
-        Two different non-divisible N values exercise the runtime pad
-        computation with different pad amounts.
+        Compile once and reuse the callable with two non-divisible N values
+        whose output/grid shape is identical but whose padded input shape is
+        different.  The Pallas JAX export is specialized to that padded shape.
         """
-        for n in [50000, 40000]:
-            x = torch.randn([4, n], device=DEVICE, dtype=torch.float32)
-            check_example(
-                "long_sum",
-                (x,),
-                x.sum(-1),
-                fn_name="longsum_manual",
-                block_sizes=[32768, 1],
-            )
+        mod = import_path(EXAMPLES_DIR / "long_sum.py")
+        config = Config(block_sizes=[32768, 1])
+        inputs = [
+            torch.randn([4, n], device=DEVICE, dtype=torch.float32)
+            for n in [50000, 40000]
+        ]
+        compiled = mod.longsum_manual.bind((inputs[0],)).compile_config(config)
+
+        for x in inputs:
+            torch.testing.assert_close(compiled(x), x.sum(-1), atol=0.1, rtol=0.01)
 
     @xfailIfPallas("JAX tracer error with dynamic shapes")
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")

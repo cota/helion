@@ -1800,6 +1800,29 @@ def _pallas_compile_jit_fn(
 _PALLAS_CACHE_ATTR = "_pallas_cache"
 
 
+def _pallas_padded_tensor_signature(
+    args: tuple[object, ...],
+    ds_pad_dims: list[tuple[int, int, int, int]] | None,
+) -> tuple[tuple[int, tuple[int, ...], object], ...]:
+    """Return the shape/dtype signature seen by the compiled JAX callable.
+
+    Pallas/JAX exports are specialized to the tensors *after* dynamic-slice
+    padding.  The launcher cache must therefore distinguish padded extents,
+    even when the Helion kernel itself has ``static_shapes=False``.
+    """
+    shapes = {
+        i: list(a.shape) for i, a in enumerate(args) if isinstance(a, torch.Tensor)
+    }
+    for arg_idx, dim, block_size, extra_pad in ds_pad_dims or []:
+        shape = shapes.get(arg_idx)
+        if shape is not None:
+            shape[dim] += (-shape[dim]) % block_size + extra_pad
+    return tuple(
+        (i, tuple(shapes[i]), cast("torch.Tensor", args[i]).dtype)
+        for i in sorted(shapes)
+    )
+
+
 def _pallas_jax_call(
     pallas_kernel: object,
     grid: tuple[int, ...],
@@ -1973,6 +1996,7 @@ def _pallas_install_launcher_cache(
         result.arg_to_tensor_pos,
         fast_path,
         None,
+        _pallas_padded_tensor_signature(args, _ds_pad_dims),
     )
     setattr(pallas_kernel, _PALLAS_CACHE_ATTR, cache)
     return cache
@@ -2004,6 +2028,7 @@ def _pallas_invoke_cached_launcher(
                 arg_to_tensor_pos,
                 fast_path,
                 direct_call,
+                cache[6],
             )
             setattr(pallas_kernel, cache_attr, cache)
 
@@ -2086,7 +2111,8 @@ def default_pallas_launcher(
             _compact_ordered_window,
         )
     cache = getattr(pallas_kernel, _PALLAS_CACHE_ATTR, None)
-    if cache is None or cache[0] != grid:
+    tensor_signature = _pallas_padded_tensor_signature(args, _ds_pad_dims)
+    if cache is None or cache[0] != grid or cache[6] != tensor_signature:
         if _compact_build_worklist is not None:
             cache = _pallas_install_compact_launcher_cache(
                 pallas_kernel,
@@ -2581,6 +2607,7 @@ def _pallas_install_compact_launcher_cache(
         result.arg_to_tensor_pos,
         fast_path,
         None,
+        _pallas_padded_tensor_signature(args, _ds_pad_dims),
     )
     setattr(pallas_kernel, _PALLAS_CACHE_ATTR, cache)
     return cache
