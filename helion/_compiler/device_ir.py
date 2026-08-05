@@ -3623,6 +3623,12 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             if defer_load_masks:
                 defer_pallas_load_masks(graph.graph)
             remove_unnecessary_masking(graph.graph)
+        if defer_load_masks:
+            # Soundness of a rebase is a whole-row-tile property, so it can only
+            # be settled once every graph has been marked.
+            from .pallas.rebased_tiles import drop_conflicting_bases
+
+            drop_conflicting_bases(device_ir.graphs)
 
         # TODO(hinriksnaer): extract into a separate step? everything below
         # is post-processing computed from the completed DeviceIR.
@@ -3857,11 +3863,17 @@ def add_tile_with_offset_metadata(graph_info: GraphInfo) -> None:
     This pass identifies FX nodes that represent `tile.index + offset` (where offset is an
     integer or SymInt), and adds the `tile_with_offset` metadata to those nodes so that
     indexing strategies can generate efficient code (e.g., tensor descriptors) for them.
+
+    The offset may also be an FX node holding a 0-d device scalar (a *rebased* tile,
+    ``base + tile.index``), but only on backends that lower that form.  Elsewhere the
+    offset reaches ``DeviceFunction.literal_expr``, which falls through to ``repr()``
+    for a node and would emit an undefined name into the generated code.
     """
     graph = graph_info.graph
     env = CompileEnvironment.current()
     add_targets = (operator.add, torch.ops.aten.add.Tensor)
     offset_types = (int, torch.SymInt)
+    allow_node_offset = env.backend.name == "pallas"
     for node in graph.nodes:
         if (
             node.op != "call_function"
@@ -3872,7 +3884,9 @@ def add_tile_with_offset_metadata(graph_info: GraphInfo) -> None:
             continue
 
         block_id: int | None = None
-        total_offset: int | torch.SymInt = 0
+        # A node is a dynamic base (see the rebased-tile note above); it cannot be
+        # folded with the constant offsets, so the two are mutually exclusive.
+        total_offset: int | torch.SymInt | torch.fx.Node = 0
         valid = True
 
         for arg in node.args:
@@ -3903,7 +3917,12 @@ def add_tile_with_offset_metadata(graph_info: GraphInfo) -> None:
                 else:
                     val = arg.meta.get("val")
                     if isinstance(val, offset_types):
-                        total_offset = total_offset + val
+                        if isinstance(total_offset, torch.fx.Node):
+                            if val != 0:
+                                valid = False
+                                break
+                        else:
+                            total_offset = total_offset + val
                         continue
 
                 if arg_block_id is not None:
@@ -3913,19 +3932,48 @@ def add_tile_with_offset_metadata(graph_info: GraphInfo) -> None:
                     if tile_offset_value is None:
                         tile_offset_value = 0
                     block_id = arg_block_id
-                    total_offset = total_offset + tile_offset_value
+                    if isinstance(total_offset, torch.fx.Node):
+                        if tile_offset_value != 0:
+                            valid = False
+                            break
+                    else:
+                        total_offset = total_offset + tile_offset_value
                     continue
 
                 val = arg.meta.get("val")
                 if isinstance(val, offset_types):
-                    total_offset = total_offset + val
+                    if isinstance(total_offset, torch.fx.Node):
+                        if val != 0:
+                            valid = False
+                            break
+                    else:
+                        total_offset = total_offset + val
+                    continue
+
+                # A zero-dimensional device scalar is a dynamic base for a
+                # contiguous tile (``base + tile.index``).  Preserve that
+                # relationship for backends that can lower the resulting
+                # rebased tile directly, rather than classifying it as an
+                # unrelated tensor index.
+                if (
+                    allow_node_offset
+                    and isinstance(val, torch.Tensor)
+                    and val.ndim == 0
+                    and total_offset == 0
+                ):
+                    total_offset = arg
                     continue
 
                 valid = False
                 break
 
             if isinstance(arg, offset_types):
-                total_offset = total_offset + arg
+                if isinstance(total_offset, torch.fx.Node):
+                    if arg != 0:
+                        valid = False
+                        break
+                else:
+                    total_offset = total_offset + arg
                 continue
             valid = False
             break
@@ -3933,10 +3981,41 @@ def add_tile_with_offset_metadata(graph_info: GraphInfo) -> None:
         if not valid or block_id is None:
             continue
 
+        if isinstance(total_offset, torch.fx.Node) and not _only_subscript_uses(node):
+            continue
+
         node.meta["tile_with_offset"] = {
             "block_id": block_id,
             "offset": total_offset,
         }
+
+
+def _only_subscript_uses(node: torch.fx.Node) -> bool:
+    """Whether ``node`` is read only as a memory-op subscript.
+
+    Lowering a rebased tile drops the explicit index vector: the base moves into
+    the loop bounds and the subscript becomes the plain tile.  Anything that
+    reads the index *values* -- arithmetic on them, or storing them as data --
+    would then see tile-relative rows instead of absolute ones, so such a sum
+    has to keep its ordinary tensor-index lowering.
+    """
+    from ..language import memory_ops
+
+    if not node.users:
+        return False
+    for user in node.users:
+        if user.target not in (memory_ops.load, memory_ops.store):
+            return False
+        if len(user.args) < 2:
+            return False
+        subscript = user.args[1]
+        if not isinstance(subscript, (list, tuple)):
+            return False
+        if not any(idx is node for idx in subscript):
+            return False
+        if any(arg is node for arg in user.args[2:]):
+            return False  # also the stored value, not only an index
+    return True
 
 
 def remove_unnecessary_tile_index(graph: torch.fx.Graph) -> None:

@@ -32,6 +32,7 @@ class CarryBoundaryTile:
     begin_var: str  # host var for the tile's runtime begin (e.g. ``s``)
     end_var: str  # host var for the tile's runtime end (e.g. ``e``)
     sublane: int  # S = backend.sublane_tiling(dtype)
+    rebased: bool = False
     carry_scratch_name: str | None = None
 
 
@@ -57,6 +58,45 @@ def is_dynamic_bound_tile(state: CodegenState, block_id: int) -> bool:
     return info.begin_expr is None and info.end_expr is None
 
 
+def rebased_tile_bounds(state: CodegenState, block_id: int) -> tuple[str, str] | None:
+    """Absolute bounds for ``base + tile.index`` over a dynamic tile extent.
+
+    ``hl.tile([end, ...])`` starts its row tile at zero.  When every row
+    access is written as ``base + tile.index``, that relative tile is still a
+    contiguous jagged window; carry needs its *absolute* bounds instead.
+    Keep this deliberately narrow: the base must be the same symbolic scalar
+    in every access using the row tile.
+    """
+    from helion._compiler.pallas import rebased_tiles
+    from helion._compiler.pallas.plan_tiling import TileIndexWithOffsetPattern
+
+    bases: set[str | None] = set()
+    for ginfo in state.codegen.codegen_graphs:
+        for node in ginfo.graph.nodes:
+            for pat in node.meta.get("indexing_patterns") or ():
+                if (
+                    isinstance(pat, TileIndexWithOffsetPattern)
+                    and pat.block_id == block_id
+                    and not isinstance(pat.offset, int)
+                ):
+                    bases.add(rebased_tiles.base_name(state, pat.offset))
+    # One base, and it must resolve: two bases move the rows by different
+    # amounts, and an unresolved one has no name to build the interval from.
+    if len(bases) != 1 or None in bases:
+        return None
+    loops = state.codegen.active_device_loops.get(block_id)
+    if not loops:
+        return None
+    info = loops[-1].block_id_to_info.get(block_id)
+    if info is None or info.begin_var_name is None or info.end_var_name is None:
+        return None
+    base = bases.pop()
+    return (
+        f"({base}) + ({info.begin_var_name})",
+        f"({base}) + ({info.end_var_name})",
+    )
+
+
 def is_row_map_axis(state: CodegenState, block_id: int) -> bool:
     """Whether each output row comes only from its own input row (a map axis).
 
@@ -68,6 +108,7 @@ def is_row_map_axis(state: CodegenState, block_id: int) -> bool:
     # a straight store; exercised only on the bmm and elementwise forms, so
     # revisit for completeness (aliasing, multiple stores, broadcast/expand).
     from helion._compiler.device_ir import ReductionLoopGraphInfo
+    from helion._compiler.pallas.plan_tiling import TileIndexWithOffsetPattern
     from helion._compiler.pallas.plan_tiling import TilePattern
     from helion.language.memory_ops import store
 
@@ -82,7 +123,7 @@ def is_row_map_axis(state: CodegenState, block_id: int) -> bool:
             for dim, pat in enumerate(patterns):
                 if getattr(pat, "block_id", None) != block_id:
                     continue
-                if not isinstance(pat, TilePattern):
+                if not isinstance(pat, (TilePattern, TileIndexWithOffsetPattern)):
                     return False  # the row is offset or scattered, not straight
                 if node.target is store and dim == 0:
                     has_straight_store = True
@@ -98,6 +139,7 @@ def needs_ordered_carry(state: CodegenState, block_id: int) -> bool:
     carry and needs none, a higher-rank store shares no boundary, and a reduction or
     scatter is not a map.
     """
+    from helion._compiler.pallas.plan_tiling import TileIndexWithOffsetPattern
     from helion._compiler.pallas.plan_tiling import TilePattern
     from helion.language.memory_ops import store
 
@@ -113,7 +155,7 @@ def needs_ordered_carry(state: CodegenState, block_id: int) -> bool:
             row_pat, col_pat = patterns
             if getattr(row_pat, "block_id", None) != block_id:
                 continue
-            if isinstance(row_pat, TilePattern) and (
+            if isinstance(row_pat, (TilePattern, TileIndexWithOffsetPattern)) and (
                 getattr(col_pat, "block_id", None) is not None
             ):
                 return True
@@ -257,17 +299,19 @@ def emit_carry_store(
         fn.carry_scratch[CarryScratchKey(row_block_id, name)] = carry
 
     row_off = state.codegen.offset_var(row_block_id)
+    if rec.rebased:
+        row_off = f"({rec.begin_var}) - ({rec.begin_var}) % {S} + ({row_off})"
     col_off = state.codegen.offset_var(col_block_id)
     begin, end = rec.begin_var, rec.end_var
-    a_start = f"({begin} - {begin} % {S})"
-    a_end = f"(({end} + {S} - 1) // {S} * {S})"
+    a_start = f"((({begin}) - ({begin}) % {S}))"
+    a_end = f"((({end}) + {S} - 1) // {S} * {S})"
     # Fold past the first group (program_id 0 has no predecessor) when begin is
     # unaligned; save the last row block when end is unaligned.
     # TODO(tcombes): assumes contiguous group offsets; a gap folds a stale carry.
     fold_guard = (
-        f"(({row_off} == {a_start}) & ({begin} % {S} != 0) & (pl.program_id(0) != 0))"
+        f"(({row_off} == {a_start}) & (({begin}) % {S} != 0) & (pl.program_id(0) != 0))"
     )
-    save_guard = f"(({row_off} + {block_row} >= {a_end}) & ({end} % {S} != 0))"
+    save_guard = f"(({row_off} + {block_row} >= {a_end}) & (({end}) % {S} != 0))"
     col_sub = f"pl.multiple_of(({col_off}) // {block_col} * {S}, {S})"
     carry_slice = f"{carry}[pl.ds({col_sub}, {S}), :]"
     # Group's last row block: S-aligned, within [0, block_row - S].

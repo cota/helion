@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from ...runtime.config import Config
+    from ..device_ir import GraphInfo
     from ..generate_ast import ResidentPrepLowering
     from ..inductor_lowering import CodegenState
     from ..tile_strategy import LoopDimInfo
@@ -193,7 +194,17 @@ def _extract_subscript_vals(subscript: object) -> list[object]:
     result: list[object] = []
     for item in subscript:
         if isinstance(item, torch.fx.Node):
-            result.append(item.meta.get("val", item))
+            # Pipeline BlockSpecs need the dynamic base of a rebased tile
+            # (``base + tile.index``), which lives in this node's metadata.
+            # Preserve that one node; ordinary subscripts keep their compact
+            # fake value representation.
+            metadata = item.meta.get("tile_with_offset")
+            result.append(
+                item
+                if isinstance(metadata, dict)
+                and isinstance(metadata.get("offset"), torch.fx.Node)
+                else item.meta.get("val", item)
+            )
         else:
             result.append(item)
     return result
@@ -606,6 +617,40 @@ def _classify_loop_tensors(
     return loaded_tensors, stored_tensors
 
 
+def _resolve_rebased_tile_offsets(graph_info: GraphInfo, state: CodegenState) -> None:
+    """Resolve dynamic tile bases to the names visible in this loop body."""
+    from helion._compiler.pallas import rebased_tiles
+    from helion._compiler.pallas.plan_tiling import TileIndexWithOffsetPattern
+
+    args = state.ast_args[-1] if state.ast_args else ()
+    if not isinstance(args, list):
+        return
+    bases = state.device_function.rebased_tile_bases
+    for node, arg in zip(
+        graph_info.graph.find_nodes(op="placeholder"), args, strict=True
+    ):
+        if isinstance(node, torch.fx.Node) and isinstance(arg, ast.AST):
+            # Keyed by node *and* by name: a base reaches this scope as the node
+            # itself, but a deeper scope only ever sees the name.
+            bases[node] = bases[node.name] = ast.unparse(arg)
+
+    for node in graph_info.graph.nodes:
+        patterns = node.meta.get("indexing_patterns") or ()
+        subscripts = node.args[1] if len(node.args) > 1 else ()
+        if not isinstance(subscripts, (list, tuple)):
+            continue
+        for pattern, subscript in zip(patterns, subscripts, strict=False):
+            if not isinstance(pattern, TileIndexWithOffsetPattern):
+                continue
+            name = rebased_tiles.base_name(state, pattern.offset)
+            if name is not None and not isinstance(pattern.offset, str):
+                # Pin the resolved name onto the pattern (and the subscript) so
+                # later scopes read this binding rather than re-resolving.
+                pattern.offset = name
+                if isinstance(subscript, torch.fx.Node):
+                    subscript.meta["pallas_rebased_tile_base"] = name
+
+
 def _tensor_dim_subscripts(subscript_meta: list[object]) -> list[object]:
     """Drop rank-expanding ``None`` entries from a tensor subscript."""
     return [index for index in subscript_meta if index is not None]
@@ -613,6 +658,13 @@ def _tensor_dim_subscripts(subscript_meta: list[object]) -> list[object]:
 
 def _subscript_at_dim(subscripts: list[object], dim: int) -> object:
     return subscripts[dim] if dim < len(subscripts) else slice(None)
+
+
+def _rebased_tile_base(state: CodegenState, subscript: object) -> str | None:
+    """Dynamic scalar base in a ``base + tile.index`` subscript, if any."""
+    from helion._compiler.pallas import rebased_tiles
+
+    return rebased_tiles.store_base(state, subscript)
 
 
 def _get_dim_block_ids(
@@ -624,6 +676,18 @@ def _get_dim_block_ids(
     if not isinstance(subscript_meta, (list, tuple)):
         return dim_to_bid
     for dim_idx, idx in enumerate(_tensor_dim_subscripts(subscript_meta)):
+        if isinstance(idx, torch.fx.Node):
+            metadata = idx.meta.get("tile_with_offset")
+            if isinstance(metadata, dict) and isinstance(
+                block_id := metadata.get("block_id"), int
+            ):
+                dim_to_bid[dim_idx] = block_id
+                continue
+            from helion._compiler.indexing_strategy import subscript_tile_info
+
+            if (tile_info := subscript_tile_info(env, idx)) is not None:
+                dim_to_bid[dim_idx] = tile_info.block_id
+                continue
         if isinstance(idx, torch.SymInt):
             bid = env.get_block_id(idx)
             if bid is not None:
@@ -990,6 +1054,9 @@ def _compute_grid_and_block_sizes(
         if block_id in aligned_dim:
             # Aligned-enclosing span: ceil(end/S)*S - floor(begin/S)*S.
             begin, end = _get_loop_begin_and_end(state, i)
+            carry = state.device_function.carry_tiles.get(block_id)
+            if carry is not None and carry.rebased:
+                begin, end = carry.begin_var, carry.end_var
             sublane = aligned_dim[block_id]
             a_start = f"(({begin}) - ({begin}) % {sublane})"
             a_end = f"((({end}) + {sublane} - 1) // {sublane} * {sublane})"
@@ -1367,6 +1434,12 @@ def _setup_inner_loop_masks(
                 # mask both ends.  The relative offset is measured from a_start.
                 sublane = aligned_dim[bid]
                 begin, end = _get_loop_begin_and_end(state, i)
+                if (
+                    bid in state.device_function.carry_tiles
+                    and state.device_function.carry_tiles[bid].rebased
+                ):
+                    carry = state.device_function.carry_tiles[bid]
+                    begin, end = carry.begin_var, carry.end_var
                 a_start = f"(({begin}) - ({begin}) % {sublane})"
                 mask_var = strategy.fn.new_var(f"mask_{bid}", dce=True)  # pyrefly: ignore[missing-attribute]
                 strategy.mask_vars[bid] = mask_var  # pyrefly: ignore[missing-attribute]
@@ -2140,6 +2213,7 @@ def _aligned_dim(
     from helion._compiler.pallas.ordered_carry import CarryBoundaryTile
     from helion._compiler.pallas.ordered_carry import is_row_map_axis
     from helion._compiler.pallas.ordered_carry import needs_ordered_carry
+    from helion._compiler.pallas.ordered_carry import rebased_tile_bounds
 
     sublanes = [
         env.backend.sublane_tiling(t.dtype)  # pyrefly: ignore[missing-attribute]
@@ -2165,9 +2239,27 @@ def _aligned_dim(
     sublane = max(sublanes)
     aligned_dim: dict[int, int] = {}
     for i, bid in enumerate(block_ids):
-        if not _loop_dim_is_dynamic(state, i):
+        rebased_bounds = rebased_tile_bounds(state, bid)
+        rebased_store_base = None
+        for fake, _node, sub_meta in stored_tensors.values():
+            if fake.ndim != 2:
+                continue
+            dim_to_bid = _get_dim_block_ids(sub_meta, env)
+            if dim_to_bid.get(0) != bid or dim_to_bid.get(1) is None:
+                continue
+            rebased_store_base = _rebased_tile_base(
+                state, _subscript_at_dim(_tensor_dim_subscripts(sub_meta), 0)
+            )
+            if rebased_store_base is not None:
+                begin, end = _get_loop_begin_and_end(state, i)
+                rebased_bounds = (
+                    f"({rebased_store_base}) + ({begin})",
+                    f"({rebased_store_base}) + ({end})",
+                )
+                break
+        if not _loop_dim_is_dynamic(state, i) and rebased_bounds is None:
             continue  # static begin or end: not a fully-dynamic jagged tile
-        carry = needs_ordered_carry(state, bid)
+        carry = needs_ordered_carry(state, bid) or rebased_store_base is not None
         direct = addressing.get(bid, SliceAddressing.ALIGNED) is SliceAddressing.DIRECT
         if direct and not carry:
             continue  # reads any offset; a plain clamped slice suffices
@@ -2182,12 +2274,13 @@ def _aligned_dim(
             )
         aligned_dim[bid] = sublane
         if carry:
-            begin, end = _get_loop_begin_and_end(state, i)
+            begin, end = rebased_bounds or _get_loop_begin_and_end(state, i)
             state.device_function.carry_tiles[bid] = CarryBoundaryTile(
                 block_id=bid,
                 begin_var=begin,
                 end_var=end,
                 sublane=sublane,
+                rebased=rebased_store_base is not None,
             )
     return aligned_dim
 
@@ -2221,6 +2314,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     has_loop_state = len(args) > 0
 
     loaded_tensors, stored_tensors = _classify_loop_tensors(graph_info, state)
+    _resolve_rebased_tile_offsets(graph_info, state)
 
     aligned_dim = _aligned_dim(state, env, block_ids, loaded_tensors, stored_tensors)
 
@@ -2327,7 +2421,14 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                 # dim), so the extent can be clamped and a partial final tile
                 # does not overrun live rows. Full-dim, from-zero loops keep the
                 # original block-index codegen (no change).
-                if not begin_is_zero or (is_store and not covers_full_dim):
+                base = _rebased_tile_base(
+                    state, _subscript_at_dim(tensor_subscripts, dim_idx)
+                )
+                if base is None and bid in state.device_function.carry_tiles:
+                    carry_begin = state.device_function.carry_tiles[bid].begin_var
+                    if carry_begin != begin_expr:
+                        base = f"({carry_begin}) - ({begin_expr})"
+                if base or not begin_is_zero or (is_store and not covers_full_dim):
                     # Dynamic ``pl.ds`` at the true element offset, with a
                     # ``pl.BoundedSlice`` block shape (required for ds-style
                     # index maps). Lifts the "emit_pipeline fails on unaligned
@@ -2337,17 +2438,18 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                         f"({begin_expr}) + ({lambda_params[bid_idx]}) "
                         f"* ({iter_step_expr})"
                     )
+                    if base:
+                        if bid in state.device_function.carry_tiles:
+                            sublane = state.device_function.carry_tiles[bid].sublane
+                            start_expr = (
+                                f"({base}) - ({base}) % {sublane} + ({start_expr})"
+                            )
+                        else:
+                            start_expr = f"({base}) + ({start_expr})"
                     if is_store and bid not in state.device_function.carry_tiles:
                         # Clamp the store extent to min(block, end - offset) so a
-                        # short final tile writes only its valid rows
-                        # [begin, end) instead of overrunning into the next
-                        # sub-range (which would corrupt it under cross-iteration
-                        # double-buffering, and is wasteful for large blocks).
-                        #
-                        # For ordered carry tiles (`bid in [...].carry_tiles`),
-                        # clamping is skipped: fixed sublane-aligned windows are
-                        # required for carry propagation, and zeroing/masking of
-                        # unowned rows is safely handled by the ordered carry logic.
+                        # short final tile writes only its valid rows [begin, end)
+                        # instead of overrunning into the next sub-range.
                         size_expr = (
                             f"jnp.minimum({slice_size_expr}, "
                             f"({end_exprs[bid_idx]}) - ({start_expr}))"
@@ -2392,6 +2494,15 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                 # same jagged dim.  Must precede the outer-non-grid branch.
                 block_m = state.device_function.block_size_var(bid)
                 offset_v = state.codegen.offset_var(bid)
+                if (
+                    bid in state.device_function.carry_tiles
+                    and state.device_function.carry_tiles[bid].rebased
+                ):
+                    carry_begin = state.device_function.carry_tiles[bid].begin_var
+                    offset_v = (
+                        f"({carry_begin}) - ({carry_begin}) % "
+                        f"{state.device_function.carry_tiles[bid].sublane} + ({offset_v})"
+                    )
                 sublane = env.backend.sublane_tiling(fake.dtype)  # pyrefly: ignore[missing-attribute]
                 block_shape_parts.append(f"pl.BoundedSlice({block_m})")
                 lambda_parts.append(

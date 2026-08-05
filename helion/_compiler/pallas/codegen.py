@@ -620,8 +620,17 @@ def _tile_index_with_offset_pattern_code(
 
     assert isinstance(pattern, TileIndexWithOffsetPattern)
 
+    from helion._compiler.pallas import rebased_tiles
+
     block_id = pattern.block_id
-    offset_str = state.device_function.literal_expr(pattern.offset)
+    if in_pipeline and (
+        block_id in pipeline_block_ids
+        or isinstance(pattern.offset, (str, torch.fx.Node))
+    ):
+        # A rebased tile's base is folded into the pipeline BlockSpec, so the
+        # body indexes the already-sliced ref.
+        return ":"
+    offset_str = rebased_tiles.offset_expr(state, pattern.offset)
     return _ds_expr(state, block_id, offset_str, tensor=tensor, tensor_dim=tensor_dim)
 
 

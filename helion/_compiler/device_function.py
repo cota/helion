@@ -354,6 +354,11 @@ class DeviceFunction:
         # One scratch per output buffer (a tile may feed several stores),
         # allocated at the store.
         self.carry_scratch: dict[CarryScratchKey, str] = {}
+        # Pallas rebased tiles (``base + tile.index``): the dynamic base node, and
+        # its node name, -> the variable holding it in the emitted loop body.  A
+        # base is bound to a different name in each pipeline scope it crosses, so
+        # the loop codegen records the mapping the index expressions then read.
+        self.rebased_tile_bases: dict[object, str] = {}
 
     def allocate_store_index(self) -> int:
         """Bump store counters and return the indexing strategy slot."""

@@ -815,6 +815,141 @@ class TestPallasClampedRefs(TestCase):
         torch.testing.assert_close(out, torch.cat([x, y], dim=1))
 
 
+@onlyBackends(["pallas"])
+@skipUnlessPallas("JAX/Pallas TPU not available")
+class TestPallasRebasedTiles(TestCase):
+    """``base + tile.index`` rows lowered as a contiguous rebased tile.
+
+    ``jagged_dense_bmm_2d_loop_offset`` covers the main path throughout this
+    file.  These pin the edges: which shapes may rebase, and which must keep the
+    indirect (``one_hot``) lowering because rebasing them would move rows that
+    do not all shift by the same amount.
+    """
+
+    @xfailIfPallasInterpret(_XFAIL_INTERPRET)
+    def test_extent_from_separate_lengths(self) -> None:
+        # The run length comes from its own tensor rather than ``end - start``.
+        # The absolute window is still ``[start, start + n)``, so this rebases.
+        @helion.kernel(backend="pallas")
+        def jagged_scale_by_length(
+            seq_offsets: torch.Tensor, seq_lengths: torch.Tensor, jagged: torch.Tensor
+        ) -> torch.Tensor:
+            L, D = jagged.shape
+            B = seq_lengths.shape[0]
+            out = torch.zeros((L, D), dtype=jagged.dtype, device=jagged.device)
+            for g in hl.grid(B):
+                s = seq_offsets[g]
+                n = seq_lengths[g]
+                for rt, dt in hl.tile([n, D]):
+                    out[s + rt.index, dt] = jagged[s + rt.index, dt] * 2.0
+            return out
+
+        seq_offsets = torch.tensor([0, 13], dtype=torch.int32, device=DEVICE)
+        seq_lengths = torch.tensor([13, 12], dtype=torch.int32, device=DEVICE)
+        jagged = torch.randn((25, 128), dtype=torch.float32, device=DEVICE)
+        code, out = code_and_output(
+            jagged_scale_by_length,
+            (seq_offsets, seq_lengths, jagged),
+            block_sizes=[16, 128],
+            pallas_loop_type="emit_pipeline",
+        )
+        self.assertNotIn("one_hot", code)
+        torch.testing.assert_close(out, jagged * 2.0)
+
+    @xfailIfPallasInterpret(_XFAIL_INTERPRET)
+    def test_two_bases_not_rebased(self) -> None:
+        # ``jagged`` is read at ``s`` but ``extra`` at ``t``.  One window cannot
+        # describe both, so rebasing either would read the other's rows wrong.
+        @helion.kernel(backend="pallas")
+        def two_base_add(
+            seq_offsets: torch.Tensor,
+            other_offsets: torch.Tensor,
+            jagged: torch.Tensor,
+            extra: torch.Tensor,
+        ) -> torch.Tensor:
+            L, D = jagged.shape
+            B = seq_offsets.shape[0] - 1
+            out = torch.zeros((L, D), dtype=jagged.dtype, device=jagged.device)
+            for g in hl.grid(B):
+                s = seq_offsets[g]
+                e = seq_offsets[g + 1]
+                t = other_offsets[g]
+                n = e - s
+                for rt, dt in hl.tile([n, D]):
+                    out[s + rt.index, dt] = (
+                        jagged[s + rt.index, dt] + extra[t + rt.index, dt]
+                    )
+            return out
+
+        seq_offsets = torch.tensor([0, 13, 25], dtype=torch.int32, device=DEVICE)
+        other_offsets = torch.tensor([3, 1], dtype=torch.int32, device=DEVICE)
+        jagged = torch.randn((25, 128), dtype=torch.float32, device=DEVICE)
+        extra = torch.randn((25, 128), dtype=torch.float32, device=DEVICE)
+        code, out = code_and_output(
+            two_base_add,
+            (seq_offsets, other_offsets, jagged, extra),
+            block_sizes=[16, 128],
+            pallas_loop_type="emit_pipeline",
+        )
+        self.assertIn("one_hot", code)
+        expected = torch.zeros_like(jagged)
+        for g in range(2):
+            s, e = int(seq_offsets[g]), int(seq_offsets[g + 1])
+            t = int(other_offsets[g])
+            expected[s:e] = jagged[s:e] + extra[t : t + (e - s)]
+        torch.testing.assert_close(out, expected)
+
+    @xfailIfPallasInterpret(_XFAIL_INTERPRET)
+    def test_index_used_as_value_not_rebased(self) -> None:
+        # A rebase drops the index vector, so anything reading the row numbers
+        # themselves would see tile-relative rows.  Keep the real index instead.
+        @helion.kernel(backend="pallas")
+        def jagged_add_row_number(
+            seq_offsets: torch.Tensor, jagged: torch.Tensor
+        ) -> torch.Tensor:
+            L, D = jagged.shape
+            B = seq_offsets.shape[0] - 1
+            out = torch.zeros((L, D), dtype=jagged.dtype, device=jagged.device)
+            for g in hl.grid(B):
+                s = seq_offsets[g]
+                e = seq_offsets[g + 1]
+                n = e - s
+                for rt, dt in hl.tile([n, D]):
+                    row = s + rt.index
+                    out[row, dt] = jagged[row, dt] + row.to(jagged.dtype)[:, None]
+            return out
+
+        seq_offsets = torch.tensor([0, 13, 25], dtype=torch.int32, device=DEVICE)
+        jagged = torch.randn((25, 128), dtype=torch.float32, device=DEVICE)
+        code, out = code_and_output(
+            jagged_add_row_number,
+            (seq_offsets, jagged),
+            block_sizes=[16, 128],
+            pallas_loop_type="emit_pipeline",
+        )
+        self.assertIn("one_hot", code)
+        rows = torch.arange(25, dtype=torch.float32, device=DEVICE)[:, None]
+        torch.testing.assert_close(out, jagged + rows)
+
+    @xfailIfPallasInterpret(_XFAIL_INTERPRET)
+    def test_rebase_survives_a_second_config(self) -> None:
+        # Base names are resolved per emit_pipeline scope while codegen runs, so
+        # a second config must rebuild them rather than reuse the first's.
+        seq_offsets, jagged, dense = _inputs([0, 13, 100], 128, 128, torch.float32)
+        expected = _ref_jagged_bmm(seq_offsets, jagged, dense)
+        for block_sizes in ([16, 128, 128], [32, 128, 128]):
+            code, out = _run(
+                seq_offsets,
+                jagged,
+                dense,
+                block_sizes,
+                kernel=jagged_dense_bmm_2d_loop_offset,
+            )
+            self.assertIn("carry", code)
+            self.assertNotIn("one_hot", code)
+            torch.testing.assert_close(out, expected)
+
+
 instantiate_parametrized_tests(TestPallasJaggedCarrySimple)
 instantiate_parametrized_tests(TestPallasJaggedCarryBmm)
 instantiate_parametrized_tests(TestPallasJaggedCarryRejects)
