@@ -2181,6 +2181,7 @@ def _aligned_dim(
                 "(its dense bf16 output store cannot be proven sublane-aligned)."
             )
         aligned_dim[bid] = sublane
+        state.device_function.aligned_tiles[bid] = sublane
         if carry:
             begin, end = _get_loop_begin_and_end(state, i)
             state.device_function.carry_tiles[bid] = CarryBoundaryTile(
@@ -2190,6 +2191,24 @@ def _aligned_dim(
                 sublane=sublane,
             )
     return aligned_dim
+
+
+def _sublane_aligned(state: CodegenState, block_id: int) -> int | None:
+    """S when a jagged dim's tile offsets are multiples of the sublane tile.
+
+    A dim ``_aligned_dim`` recorded in ``aligned_tiles`` starts at an S-aligned
+    begin and steps by its block size, so every tile offset is a true multiple
+    of S once the block size is one too.  ``pl.multiple_of`` is then an honest
+    promise, and it is what lets Mosaic slice a tiled (sublane) dim at a runtime
+    offset.  Returns None for every other dim, whose offset must stay as-is.
+    """
+    sublane = state.device_function.aligned_tiles.get(block_id)
+    if sublane is None:
+        return None
+    block = state.device_function.resolved_block_size(block_id)
+    if not isinstance(block, int) or block % sublane != 0:
+        return None
+    return sublane
 
 
 def _codegen_emit_pipeline(state: CodegenState) -> object:
@@ -2384,19 +2403,23 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                     block_shape_parts.append(str(int(shape[dim_idx])))
                 lambda_parts.append(pid_var)
             elif bid is not None and is_dynamic_bound_tile(state, bid):
-                # Jagged row tile from an inner pipeline.  pl.multiple_of is
-                # assume_multiple: it suppresses the tiled-row alignment check.
-                # Safe because the begin is rounded to the sublane in the dim's
-                # own loop, and a DIRECT f32 single-lane-tile row reads
-                # contiguously.  Always emitted, as sibling loops reference the
-                # same jagged dim.  Must precede the outer-non-grid branch.
+                # Jagged row tile from an inner pipeline.  Always emitted, as
+                # sibling loops reference the same jagged dim.  Must precede the
+                # outer-non-grid branch.  pl.multiple_of is assume_multiple: it
+                # suppresses the tiled-row alignment check, so only claim it for
+                # a dim whose own loop really rounded its begin to the sublane
+                # (_sublane_aligned).  Claiming it for an unaligned window would
+                # let Mosaic read from the wrong row instead of rejecting.
                 block_m = state.device_function.block_size_var(bid)
                 offset_v = state.codegen.offset_var(bid)
-                sublane = env.backend.sublane_tiling(fake.dtype)  # pyrefly: ignore[missing-attribute]
-                block_shape_parts.append(f"pl.BoundedSlice({block_m})")
-                lambda_parts.append(
-                    f"pl.ds(pl.multiple_of({offset_v}, {sublane}), {block_m})"
+                aligned = _sublane_aligned(state, bid)
+                start_expr = (
+                    f"pl.multiple_of({offset_v}, {aligned})"
+                    if aligned is not None
+                    else offset_v
                 )
+                block_shape_parts.append(f"pl.BoundedSlice({block_m})")
+                lambda_parts.append(f"pl.ds({start_expr}, {block_m})")
             elif bid is not None and state.codegen.active_device_loops.get(bid):
                 # Outer non-grid device loop -- the HBM ref is pre-sliced via
                 # ``.at[pl.ds(offset, bs)]`` (see _make_hbm_slice), so the
