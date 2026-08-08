@@ -25,6 +25,12 @@ _XFAIL_INTERPRET = (
     "Pallas interpret mode"
 )
 
+# Proof the kernel really lowered through the requested loop type.
+_LOOP_MARKER = {
+    "fori_loop": "jax.lax.fori_loop",
+    "emit_pipeline": "pltpu.emit_pipeline",
+}
+
 
 # out[s:e] = jagged[s:e] @ dense[g] for each group g delimited by seq_offsets.
 # The row tile hl.tile(s, e) has runtime bounds; unaligned group boundaries make
@@ -109,6 +115,16 @@ def _run(seq_offsets, jagged, dense, block_sizes, kernel=jagged_dense_bmm):
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallasJaggedCarrySimple(TestCase):
     """Minimal kernels that isolate one carry behaviour each."""
+
+    @parametrize("kernel", _BMM_KERNELS)
+    def test_default_config(self, kernel) -> None:
+        # No pinned config: data-dependent bounds make the default loop type
+        # fori_loop, which is also what HELION_AUTOTUNE_EFFORT=none and the
+        # autotuner's baseline compile, so the carry has to work there.
+        seq_offsets, jagged, dense = _inputs([0, 13, 25], 128, 128, torch.bfloat16)
+        code, out = code_and_output(kernel, (seq_offsets, jagged, dense))
+        self.assertIn(_LOOP_MARKER["fori_loop"], code)
+        torch.testing.assert_close(out, _ref_jagged_bmm(seq_offsets, jagged, dense))
 
     @xfailIfPallasInterpret(_XFAIL_INTERPRET)
     @parametrize("dtype", [torch.float32, torch.bfloat16])

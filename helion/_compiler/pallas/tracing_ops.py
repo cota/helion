@@ -3148,11 +3148,18 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     assert isinstance(proxy_args, list)
     has_loop_state = len(args) > 0
 
-    grid_parts, block_size_vars = _compute_grid_and_block_sizes(state, block_ids, env)
-
     loaded_tensors, stored_tensors = _classify_loop_tensors(graph_info, state)
+
+    # Jagged row tiles read (and store) an S-aligned enclosing window, exactly as
+    # on the emit_pipeline path: Mosaic cannot slice a tiled dim at an arbitrary
+    # offset, and the ordered carry stitches the boundary two groups share.
+    aligned_dim = _aligned_dim(state, env, block_ids, loaded_tensors, stored_tensors)
+
+    grid_parts, block_size_vars = _compute_grid_and_block_sizes(
+        state, block_ids, env, aligned_dim
+    )
     begin_exprs, iter_step_exprs, slice_size_exprs = _pallas_loop_begin_and_step_exprs(
-        state, block_ids, block_size_vars
+        state, block_ids, block_size_vars, aligned_dim
     )
 
     # --- Handle loop-carried state as scratch VMEM buffers ---
@@ -3357,6 +3364,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         body_stmts,
         # fori_loop has direct access to the loop variable
         offset_expr_fn=lambda i, bs: f"{dim_idx_exprs[i]} * {bs} + jnp.arange({bs})",
+        aligned_dim=aligned_dim,
     )
 
     fori_state = ForiLoopState(
@@ -3393,7 +3401,9 @@ def _codegen_fori_loop(state: CodegenState) -> object:
         ``min(block_size, end - offset)`` and the VMEM side sliced to match, so
         only live rows are written instead of overrunning adjacent regions
         packed in the same tensor; with ``clamp=False`` (loads, dense stores)
-        the VMEM side stays the bare buffer.
+        the VMEM side stays the bare buffer.  A jagged dim that reads an
+        S-aligned window (``aligned_tiles``) keeps its full block on both sides
+        and advertises the alignment instead -- see ``_sublane_aligned``.
         """
         from helion._compiler.pallas.ordered_carry import is_dynamic_bound_tile
 
@@ -3414,10 +3424,21 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                 slice_size_expr = slice_size_exprs[bid_idx]
                 dim_idx_expr = iteration_indices[bid_idx]
                 offset_expr = f"({begin_expr}) + ({dim_idx_expr}) * ({iter_step_expr})"
+                aligned_offset_expr = _aligned_offset(
+                    state,
+                    bid,
+                    offset_expr,
+                    steps_by_block=iter_step_expr == block_size_vars[bid_idx],
+                )
                 # Mosaic requires the lane (/128) and sublane (/8) VMEM dims to
                 # stay tile-aligned, so only clamp dims outside the last two; a
                 # ragged store on a last-two dim can't clamp and is rejected.
-                if clamp and dim_idx < len(shape) - 2:
+                if clamp and bid in state.device_function.carry_tiles:
+                    # Ordered carry: the window is S-aligned and fixed-size, and
+                    # the store value already has its unowned rows zeroed and the
+                    # shared boundary folded in, so the whole block goes out.
+                    vmem_parts.append(":")
+                elif clamp and dim_idx < len(shape) - 2:
                     end_expr = _get_loop_begin_and_end(state, bid_idx)[1]
                     slice_size_expr = f"jnp.minimum({slice_size_expr}, ({end_expr}) - ({offset_expr}))"
                     vmem_parts.append(f"pl.ds(0, {slice_size_expr})")
@@ -3434,14 +3455,14 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                     )
                 else:
                     vmem_parts.append(":")
-                hbm_parts.append(f"pl.ds({offset_expr}, {slice_size_expr})")
+                hbm_parts.append(f"pl.ds({aligned_offset_expr}, {slice_size_expr})")
                 hbm_needs_slice = True
                 _record_loop_pad(state, fake, dim_idx, bid, begin_expr)
             elif bid is not None and bid not in block_ids:
                 # Outer grid dim: use grid offset
                 grid_loops = state.codegen.active_device_loops.get(bid)
                 if grid_loops:
-                    offset = state.codegen.offset_var(bid)
+                    offset = _aligned_offset(state, bid, state.codegen.offset_var(bid))
                     bs_var = state.device_function.block_size_var(bid)
                     if bs_var:
                         hbm_parts.append(f"pl.ds({offset}, {bs_var})")
