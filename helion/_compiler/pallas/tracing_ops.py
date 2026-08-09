@@ -554,6 +554,7 @@ def _emit_resident_prep_refill_once(
 
 
 LoopTensors = dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]]
+LoopAccesses = list[tuple[torch.Tensor, list[object]]]
 
 
 def _classify_loop_tensors(
@@ -605,6 +606,47 @@ def _classify_loop_tensors(
                     stored_tensors[key] = (fake, tensor_node, sub_vals)
 
     return loaded_tensors, stored_tensors
+
+
+def _tensor_accesses(*tensor_maps: LoopTensors) -> LoopAccesses:
+    """The ``(tensor, subscript)`` pairs of one or more classify results."""
+    return [
+        (fake, sub) for tensors in tensor_maps for fake, _node, sub in tensors.values()
+    ]
+
+
+def _nested_loop_accesses(
+    graph_info: object,
+    state: CodegenState,
+) -> LoopAccesses:
+    """Every ``(tensor, subscript)`` a loop nested inside ``graph_info`` accesses.
+
+    ``_classify_loop_tensors`` walks one graph and stops at a nested ``_for_loop``
+    node, so a tile whose tensors are all sliced one loop deeper looks like it
+    touches nothing at all.  Alignment is not a per-loop question -- a nested
+    slice of an outer tile still lands wherever the outer loop's window put it --
+    so ``_aligned_dim`` folds these in as well.  The DMA and BlockSpec plumbing
+    must stay strictly per-loop, which is why this is a separate walk rather than
+    an option on ``_classify_loop_tensors``.
+    """
+    from ...language._tracing_ops import is_for_loop_target
+
+    accesses: LoopAccesses = []
+    seen: set[int] = set()
+    pending: list[object] = [graph_info]
+    while pending:
+        info = pending.pop()
+        for node in info.graph.nodes:  # type: ignore[union-attr]
+            if node.op != "call_function" or not is_for_loop_target(node.target):
+                continue
+            graph_id = node.args[0]
+            if not isinstance(graph_id, int) or graph_id in seen:
+                continue
+            seen.add(graph_id)
+            child = state.get_graph(graph_id)
+            accesses.extend(_tensor_accesses(*_classify_loop_tensors(child, state)))
+            pending.append(child)
+    return accesses
 
 
 def _tensor_dim_subscripts(subscript_meta: list[object]) -> list[object]:
@@ -1102,6 +1144,8 @@ def _record_loop_pad(
 ) -> None:
     """Record the host-side pad this dim's ``pl.ds`` slice needs.
 
+    Every dim sliced at a runtime offset needs one: the last tile can overshoot
+    the tensor, and with an aligned window it overshoots the aligned end too.
     ``begin_expr`` defaults to the enclosing loop's begin, which is what the
     outer-dim branches want; an inner loop passes its own begin instead.  The
     BlockSpec and DMA paths must agree here -- a dim padded on one path and not
@@ -2145,8 +2189,7 @@ def _aligned_dim(
     state: CodegenState,
     env: CompileEnvironment,
     block_ids: list[int],
-    loaded_tensors: LoopTensors,
-    stored_tensors: LoopTensors,
+    accesses: LoopAccesses,
 ) -> dict[int, int]:
     """Jagged row tiles (runtime end) that read an aligned-enclosing window.
 
@@ -2156,12 +2199,17 @@ def _aligned_dim(
     A DIRECT row that does not carry is omitted: it reads at the exact offset.  S
     is the largest float-tensor sublane (bf16 forces 16); tiles that carry are
     also registered for the store fold/save.
+
+    ``accesses`` spans this loop AND every loop nested inside it: a tile can
+    slice nothing itself and still owe its window an alignment, because the
+    nested loop slices the tile's dim at whatever offset this loop hands it.
     """
     from .backend import SliceAddressing
     from .backend import _slice_addressing
     from helion._compiler.pallas.ordered_carry import CarryBoundaryTile
     from helion._compiler.pallas.ordered_carry import is_row_map_axis
     from helion._compiler.pallas.ordered_carry import needs_ordered_carry
+    from helion._compiler.pallas.ordered_carry import stores_through_row
 
     sublanes = [
         env.backend.sublane_tiling(t.dtype)  # pyrefly: ignore[missing-attribute]
@@ -2173,7 +2221,7 @@ def _aligned_dim(
 
     # Strictest addressing each row needs over the tensors it slices.
     addressing: dict[int, SliceAddressing] = {}
-    for fake, _node, sub_meta in (*loaded_tensors.values(), *stored_tensors.values()):
+    for fake, sub_meta in accesses:
         if not (isinstance(fake, torch.Tensor) and fake.is_floating_point()):
             continue
         dim_to_bid = _get_dim_block_ids(sub_meta, env)
@@ -2193,17 +2241,20 @@ def _aligned_dim(
         if not carry:
             addr = addressing.get(bid)
             if addr is None or addr is SliceAddressing.DIRECT:
-                # No tensor visible here slices the dim, so there is no window to
-                # align; or it reads at any offset and a clamped slice suffices.
+                # Nothing in or below this loop slices the dim (no window to
+                # align), or it reads at any offset and a clamped slice suffices.
                 continue
-            if not is_row_map_axis(state, bid):
-                # ALIGNED but not a map axis: a bf16 reduction over the row.  Its
-                # dense bf16 output store can't be proven aligned for Mosaic
-                # (E2003), so reject it cleanly here instead.  f32 reductions are
-                # DIRECT and already skipped above.
+            if not is_row_map_axis(state, bid) and stores_through_row(state, bid):
+                # ALIGNED, and rows go out through this dim, but the store is not
+                # the straight map the carry can stitch.  The aligned window
+                # would write rows the group does not own, so reject it cleanly
+                # rather than corrupting a neighbour.  A row that is reduced away
+                # instead only over-READS, which the two-sided mask zeroes.
                 raise NotImplementedError(
-                    "Pallas: bf16 reduction over a jagged row is not supported yet "
-                    "(its dense bf16 output store cannot be proven sublane-aligned)."
+                    "Pallas: a jagged row tile whose slices must be "
+                    "sublane-aligned and that is stored through its row dim is "
+                    "only supported when the store is a straight per-row map "
+                    "(the ordered carry's shape)."
                 )
         aligned_dim[bid] = sublane
         state.device_function.aligned_tiles[bid] = sublane
@@ -2258,7 +2309,15 @@ def _plan_inner_loop_window(
     prefetch).
     """
     loaded, stored = _classify_loop_tensors(graph_info, state)
-    aligned_dim = _aligned_dim(state, env, block_ids, loaded, stored)
+    aligned_dim = _aligned_dim(
+        state,
+        env,
+        block_ids,
+        [
+            *_tensor_accesses(loaded, stored),
+            *_nested_loop_accesses(graph_info, state),
+        ],
+    )
     grid_parts, block_size_vars = _compute_grid_and_block_sizes(
         state, block_ids, env, aligned_dim
     )

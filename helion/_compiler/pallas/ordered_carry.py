@@ -89,6 +89,29 @@ def is_row_map_axis(state: CodegenState, block_id: int) -> bool:
     return has_straight_store
 
 
+def stores_through_row(state: CodegenState, block_id: int) -> bool:
+    """Whether any store is indexed by ``block_id``.
+
+    False means the jagged row never reaches an output dim -- it is reduced (or
+    otherwise collapsed) away -- so rounding its window out to a sublane boundary
+    only over-READS, which the two-sided window mask zeroes.  True means rows
+    leave through that dim, where the extra rows would be WRITTEN and only the
+    ordered carry can stitch the boundary two groups share.
+    """
+    from helion.language.memory_ops import store
+
+    for ginfo in state.codegen.codegen_graphs:
+        for node in ginfo.graph.nodes:
+            if node.target is not store:
+                continue
+            patterns = node.meta.get("indexing_patterns")
+            if not patterns:
+                continue
+            if any(getattr(pat, "block_id", None) == block_id for pat in patterns):
+                return True
+    return False
+
+
 def needs_ordered_carry(state: CodegenState, block_id: int) -> bool:
     """Whether this row tile needs the sublane carry.
 
