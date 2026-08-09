@@ -2431,6 +2431,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                 )
                 block_shape_parts.append(f"pl.BoundedSlice({block_m})")
                 lambda_parts.append(f"pl.ds({start_expr}, {block_m})")
+                _record_loop_pad(state, fake, dim_idx, bid)
             elif bid is not None and state.codegen.active_device_loops.get(bid):
                 # Outer non-grid device loop -- the HBM ref is pre-sliced via
                 # ``.at[pl.ds(offset, bs)]`` (see _make_hbm_slice), so the
