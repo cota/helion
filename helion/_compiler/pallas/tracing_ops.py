@@ -2189,18 +2189,21 @@ def _aligned_dim(
         if not _loop_dim_is_dynamic(state, i):
             continue  # static begin or end: not a fully-dynamic jagged tile
         carry = needs_ordered_carry(state, bid)
-        direct = addressing.get(bid, SliceAddressing.ALIGNED) is SliceAddressing.DIRECT
-        if direct and not carry:
-            continue  # reads any offset; a plain clamped slice suffices
-        if not carry and not is_row_map_axis(state, bid):
-            # ALIGNED but not a map axis: a bf16 reduction over the row.  Its
-            # dense bf16 output store can't be proven aligned for Mosaic (E2003),
-            # so reject it cleanly here instead.  f32 reductions are DIRECT and
-            # already skipped above.
-            raise NotImplementedError(
-                "Pallas: bf16 reduction over a jagged row is not supported yet "
-                "(its dense bf16 output store cannot be proven sublane-aligned)."
-            )
+        if not carry:
+            addr = addressing.get(bid)
+            if addr is None or addr is SliceAddressing.DIRECT:
+                # No tensor visible here slices the dim, so there is no window to
+                # align; or it reads at any offset and a clamped slice suffices.
+                continue
+            if not is_row_map_axis(state, bid):
+                # ALIGNED but not a map axis: a bf16 reduction over the row.  Its
+                # dense bf16 output store can't be proven aligned for Mosaic
+                # (E2003), so reject it cleanly here instead.  f32 reductions are
+                # DIRECT and already skipped above.
+                raise NotImplementedError(
+                    "Pallas: bf16 reduction over a jagged row is not supported yet "
+                    "(its dense bf16 output store cannot be proven sublane-aligned)."
+                )
         aligned_dim[bid] = sublane
         state.device_function.aligned_tiles[bid] = sublane
         if carry:
