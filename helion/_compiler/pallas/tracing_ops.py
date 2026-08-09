@@ -2232,6 +2232,28 @@ def _sublane_aligned(state: CodegenState, block_id: int) -> int | None:
     return sublane
 
 
+def _aligned_offset(
+    state: CodegenState,
+    block_id: int,
+    offset_expr: str,
+    *,
+    steps_by_block: bool = True,
+) -> str:
+    """Wrap ``offset_expr`` in ``pl.multiple_of`` when the promise is honest.
+
+    ``pl.multiple_of`` is assume_multiple: it suppresses Mosaic's tiled-row
+    alignment check rather than proving anything, so it may only be claimed for a
+    dim whose own loop really rounded its begin to the sublane
+    (``_sublane_aligned``) and that steps by its block size.  Claiming it for an
+    unaligned window would let Mosaic read from the wrong row instead of
+    rejecting.  Every other offset comes back unchanged.
+    """
+    aligned = _sublane_aligned(state, block_id) if steps_by_block else None
+    if aligned is None:
+        return offset_expr
+    return f"pl.multiple_of({offset_expr}, {aligned})"
+
+
 def _codegen_emit_pipeline(state: CodegenState) -> object:
     """Emit inner device loops using pltpu.emit_pipeline.
 
@@ -2389,9 +2411,13 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                         )
                     else:
                         size_expr = slice_size_expr
-                    if bid in state.device_function.carry_tiles:
-                        sublane = state.device_function.carry_tiles[bid].sublane
-                        start_expr = f"pl.multiple_of({start_expr}, {sublane})"
+                    # Carried tiles are aligned tiles, so this covers them too.
+                    start_expr = _aligned_offset(
+                        state,
+                        bid,
+                        start_expr,
+                        steps_by_block=iter_step_expr == block_size_vars[bid_idx],
+                    )
                     lambda_parts.append(f"pl.ds({start_expr}, {size_expr})")
                 else:
                     # Static, from-zero loop: a block-aligned index is exact.
@@ -2416,19 +2442,9 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
             elif bid is not None and is_dynamic_bound_tile(state, bid):
                 # Jagged row tile from an inner pipeline.  Always emitted, as
                 # sibling loops reference the same jagged dim.  Must precede the
-                # outer-non-grid branch.  pl.multiple_of is assume_multiple: it
-                # suppresses the tiled-row alignment check, so only claim it for
-                # a dim whose own loop really rounded its begin to the sublane
-                # (_sublane_aligned).  Claiming it for an unaligned window would
-                # let Mosaic read from the wrong row instead of rejecting.
+                # outer-non-grid branch.
                 block_m = state.device_function.block_size_var(bid)
-                offset_v = state.codegen.offset_var(bid)
-                aligned = _sublane_aligned(state, bid)
-                start_expr = (
-                    f"pl.multiple_of({offset_v}, {aligned})"
-                    if aligned is not None
-                    else offset_v
-                )
+                start_expr = _aligned_offset(state, bid, state.codegen.offset_var(bid))
                 block_shape_parts.append(f"pl.BoundedSlice({block_m})")
                 lambda_parts.append(f"pl.ds({start_expr}, {block_m})")
                 _record_loop_pad(state, fake, dim_idx, bid)
