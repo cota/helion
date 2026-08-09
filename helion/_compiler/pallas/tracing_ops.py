@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import dataclasses
 import logging
 import operator
 from typing import TYPE_CHECKING
@@ -552,13 +553,13 @@ def _emit_resident_prep_refill_once(
     state.codegen.grouped_resident_prep_refill_cache[refill_key] = "emitted"
 
 
+LoopTensors = dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]]
+
+
 def _classify_loop_tensors(
     graph_info: object,
     state: object,
-) -> tuple[
-    dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]],
-    dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]],
-]:
+) -> tuple[LoopTensors, LoopTensors]:
     """Classify tensors accessed in an inner loop body into loaded/stored.
 
     Returns (loaded_tensors, stored_tensors) dicts keyed by id(fake_tensor).
@@ -572,8 +573,8 @@ def _classify_loop_tensors(
             if "val" in node.meta and isinstance(node.meta["val"], torch.Tensor):
                 host_tensor_nodes[node] = node.meta["val"]
 
-    loaded_tensors: dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]] = {}
-    stored_tensors: dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]] = {}
+    loaded_tensors: LoopTensors = {}
+    stored_tensors: LoopTensors = {}
 
     for node in graph_info.graph.nodes:  # type: ignore[union-attr]
         if node.op != "call_function":
@@ -2144,8 +2145,8 @@ def _aligned_dim(
     state: CodegenState,
     env: CompileEnvironment,
     block_ids: list[int],
-    loaded_tensors: dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]],
-    stored_tensors: dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]],
+    loaded_tensors: LoopTensors,
+    stored_tensors: LoopTensors,
 ) -> dict[int, int]:
     """Jagged row tiles (runtime end) that read an aligned-enclosing window.
 
@@ -2217,6 +2218,66 @@ def _aligned_dim(
     return aligned_dim
 
 
+@dataclasses.dataclass(frozen=True)
+class InnerLoopWindow:
+    """The iteration window an inner tile loop generates code against.
+
+    The parts below are one decision, not four: a jagged dim that reads an
+    S-aligned enclosing window (``aligned_dim``) must have that alignment show
+    up in its grid extent, in its begin, and in its mask.  Reflect it in only
+    some of them and the loop reads or writes rows it does not own, so both
+    streaming lowerings take the window from here instead of each assembling
+    its own.
+    """
+
+    loaded: LoopTensors
+    stored: LoopTensors
+    aligned_dim: dict[int, int]
+    grid_parts: list[str]
+    block_size_vars: list[str]
+    begin_exprs: list[str]
+    iter_step_exprs: list[str]
+    slice_size_exprs: list[str]
+    end_exprs: list[str]
+
+
+def _plan_inner_loop_window(
+    state: CodegenState,
+    graph_info: object,
+    block_ids: list[int],
+    env: CompileEnvironment,
+) -> InnerLoopWindow:
+    """Build the window ``_codegen_emit_pipeline`` and ``_codegen_fori_loop`` share.
+
+    ``_codegen_dynamic_unroll`` stays out: the config spec never picks "unroll"
+    for a data-dependent bound, so it never sees a jagged tile to align and
+    needs none of this.
+
+    Every list is built fresh, so a caller is free to rewrite entries of the one
+    it gets (fori_loop rewrites the last grid part when it primes a DMA
+    prefetch).
+    """
+    loaded, stored = _classify_loop_tensors(graph_info, state)
+    aligned_dim = _aligned_dim(state, env, block_ids, loaded, stored)
+    grid_parts, block_size_vars = _compute_grid_and_block_sizes(
+        state, block_ids, env, aligned_dim
+    )
+    begin_exprs, iter_step_exprs, slice_size_exprs = _pallas_loop_begin_and_step_exprs(
+        state, block_ids, block_size_vars, aligned_dim
+    )
+    return InnerLoopWindow(
+        loaded=loaded,
+        stored=stored,
+        aligned_dim=aligned_dim,
+        grid_parts=grid_parts,
+        block_size_vars=block_size_vars,
+        begin_exprs=begin_exprs,
+        iter_step_exprs=iter_step_exprs,
+        slice_size_exprs=slice_size_exprs,
+        end_exprs=[_get_loop_begin_and_end(state, i)[1] for i in range(len(block_ids))],
+    )
+
+
 def _sublane_aligned(state: CodegenState, block_id: int) -> int | None:
     """S when a jagged dim's tile offsets are multiples of the sublane tile.
 
@@ -2285,18 +2346,15 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     assert isinstance(proxy_args, list)
     has_loop_state = len(args) > 0
 
-    loaded_tensors, stored_tensors = _classify_loop_tensors(graph_info, state)
-
-    aligned_dim = _aligned_dim(state, env, block_ids, loaded_tensors, stored_tensors)
-
-    grid_parts, block_size_vars = _compute_grid_and_block_sizes(
-        state, block_ids, env, aligned_dim
-    )
-    begin_exprs, iter_step_exprs, slice_size_exprs = _pallas_loop_begin_and_step_exprs(
-        state, block_ids, block_size_vars, aligned_dim
-    )
-    # Loop end expressions (used to clamp store extents for data-dependent begins).
-    end_exprs = [_get_loop_begin_and_end(state, i)[1] for i in range(len(block_ids))]
+    window = _plan_inner_loop_window(state, graph_info, block_ids, env)
+    loaded_tensors, stored_tensors = window.loaded, window.stored
+    aligned_dim = window.aligned_dim
+    grid_parts, block_size_vars = window.grid_parts, window.block_size_vars
+    begin_exprs = window.begin_exprs
+    iter_step_exprs = window.iter_step_exprs
+    slice_size_exprs = window.slice_size_exprs
+    # Loop ends, used to clamp store extents for data-dependent begins.
+    end_exprs = window.end_exprs
 
     # Pipelined tensors flow through emit_pipeline's per-iter Buffered
     # BlockSpec; the rest stay on the outer pallas_call BlockSpec
@@ -3148,19 +3206,17 @@ def _codegen_fori_loop(state: CodegenState) -> object:
     assert isinstance(proxy_args, list)
     has_loop_state = len(args) > 0
 
-    loaded_tensors, stored_tensors = _classify_loop_tensors(graph_info, state)
-
     # Jagged row tiles read (and store) an S-aligned enclosing window, exactly as
     # on the emit_pipeline path: Mosaic cannot slice a tiled dim at an arbitrary
     # offset, and the ordered carry stitches the boundary two groups share.
-    aligned_dim = _aligned_dim(state, env, block_ids, loaded_tensors, stored_tensors)
-
-    grid_parts, block_size_vars = _compute_grid_and_block_sizes(
-        state, block_ids, env, aligned_dim
-    )
-    begin_exprs, iter_step_exprs, slice_size_exprs = _pallas_loop_begin_and_step_exprs(
-        state, block_ids, block_size_vars, aligned_dim
-    )
+    window = _plan_inner_loop_window(state, graph_info, block_ids, env)
+    loaded_tensors, stored_tensors = window.loaded, window.stored
+    aligned_dim = window.aligned_dim
+    grid_parts, block_size_vars = window.grid_parts, window.block_size_vars
+    begin_exprs = window.begin_exprs
+    iter_step_exprs = window.iter_step_exprs
+    slice_size_exprs = window.slice_size_exprs
+    end_exprs = window.end_exprs
 
     # --- Handle loop-carried state as scratch VMEM buffers ---
     scratch_names: list[str] = []
@@ -3439,7 +3495,7 @@ def _codegen_fori_loop(state: CodegenState) -> object:
                     # shared boundary folded in, so the whole block goes out.
                     vmem_parts.append(":")
                 elif clamp and dim_idx < len(shape) - 2:
-                    end_expr = _get_loop_begin_and_end(state, bid_idx)[1]
+                    end_expr = end_exprs[bid_idx]
                     slice_size_expr = f"jnp.minimum({slice_size_expr}, ({end_expr}) - ({offset_expr}))"
                     vmem_parts.append(f"pl.ds(0, {slice_size_expr})")
                     vmem_needs_slice = True
