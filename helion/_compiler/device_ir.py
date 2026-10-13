@@ -3774,6 +3774,10 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             config_spec.pallas_load_buffer_count.length = len(
                 LiftTensorArgs(dict(func.params.arguments)).get_tensor_args()
             )
+        if config_spec.supports_config_key("pallas_worklist_buffer_count"):
+            config_spec.pallas_worklist_buffer_count.length = len(
+                LiftTensorArgs(dict(func.params.arguments)).get_tensor_args()
+            )
         if config_spec.supports_config_key("pallas_indirect_access_mode"):
             from .pallas.tensorcore_plan import indirect_access_modes
 
