@@ -4285,6 +4285,59 @@ def _runtime_vmem_shape_sources(
     return tuple(result)
 
 
+def _accesses_share_window(
+    reference: torch.fx.Node, block_ids: Sequence[int], state: CodegenState
+) -> bool:
+    """Whether every load and store of ``reference``'s tensor reads its window.
+
+    A streamed tensor gets one window per loop step, sized and placed from the
+    subscript of ``reference``, and every access then indexes that window. An
+    access at the same subscript reads all of it, and ``tile.begin + c`` where
+    ``reference`` has ``tile`` reads its row ``c``. Other subscripts, e.g.
+    ``w[k, n.index + half]`` beside ``w[k, n]`` or ``x[0, 0]`` beside
+    ``x[m, n]``, address elements outside the window.
+    """
+    from ...language.memory_ops import load as _load_op
+    from ...language.memory_ops import store as _store_op
+    from .plan_tiling import TileBeginWithOffsetPattern
+    from .plan_tiling import TilePattern
+
+    def tensor_dims(node: torch.fx.Node) -> list[tuple[object, object]] | None:
+        access = node.meta.get(MEMORY_ACCESS_META)
+        if not isinstance(access, MemoryAccess):
+            return None
+        return [
+            (index, pattern)
+            for index, pattern in zip(access.subscript, access.patterns, strict=True)
+            if index is not None
+        ]
+
+    expected = tensor_dims(reference)
+    tensor_node = reference.args[0]
+    assert isinstance(tensor_node, torch.fx.Node)
+    for user in tensor_node.users:
+        if user.op != "call_function" or user.target not in (_load_op, _store_op):
+            continue
+        dims = tensor_dims(user)
+        if expected is None or dims is None or len(dims) != len(expected):
+            return False
+        for (index, pattern), (ref_index, ref_pattern) in zip(dims, expected):
+            if index is ref_index or index == ref_index:
+                continue
+            if not (
+                isinstance(pattern, TileBeginWithOffsetPattern)
+                and isinstance(ref_pattern, TilePattern)
+                and pattern.block_id == ref_pattern.block_id
+                and pattern.block_id in block_ids
+                and isinstance(pattern.offset, int)
+            ):
+                return False
+            block_size = state.device_function.resolved_block_size(pattern.block_id)
+            if not (isinstance(block_size, int) and 0 <= pattern.offset < block_size):
+                return False
+    return True
+
+
 def _classify_pipelined_tensors(
     loaded_tensors: LoopTensors,
     stored_tensors: LoopTensors,
@@ -4391,6 +4444,18 @@ def _classify_pipelined_tensors(
                         PallasMemorySpace.HBM
                     )
                     continue
+            reference = first_load
+        else:
+            tensor_node = stored_tensors[id(fake)][1]
+            reference = next(
+                node
+                for node in tensor_node.graph.nodes
+                if node.op == "call_function"
+                and node.target is _store_op
+                and node.args[0] is tensor_node
+            )
+        if not _accesses_share_window(reference, block_ids, state):
+            continue
         dim_to_bid = _get_dim_block_ids(sub_meta, env)
         if state.device_function.is_pallas_remote_copy_operand(fake) and not set(
             dim_to_bid.values()
