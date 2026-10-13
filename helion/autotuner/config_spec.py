@@ -6336,6 +6336,7 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         min_size: int = 1,
         max_size: int | None = None,
         bounded_by_block_id: int | None = None,
+        data_dependent: bool = False,
     ) -> None:
         super().__init__([block_id])
         self.size_hint = size_hint
@@ -6362,6 +6363,7 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         self.default_size: int | None = None
         # Outer block_id whose tile extent caps this block's size in normalize().
         self.bounded_by_block_id: int | None = bounded_by_block_id
+        self.data_dependent: bool = data_dependent
         if self.max_size < self.min_size:
             self.max_size = self.min_size
         assert self.min_size <= self.max_size

@@ -1170,6 +1170,31 @@ class TestPallasJaggedCarryRejects(TestCase):
 
 @onlyBackends(["pallas"])
 @skipUnlessPallas("JAX/Pallas TPU not available")
+class TestPallasJaggedAutotuneViability(TestCase):
+    """Autotuner viability check on an hl.grid over jagged rows."""
+
+    def test_grid_and_jagged_rows(self) -> None:
+        args = _inputs([0, 13, 25], 128, 4096, torch.bfloat16)
+        spec = jagged_dense_bmm.bind(args).config_spec
+
+        def viable(
+            block_sizes: list[int], loop_type: str, *, low_level: bool = False
+        ) -> bool:
+            config = helion.Config(
+                block_sizes=block_sizes,
+                pallas_loop_type=loop_type,
+                pallas_use_low_level_scheduler=low_level,
+            )
+            return spec.backend.autotune_config_is_viable(spec, config)
+
+        self.assertTrue(viable([16, 128, 128], "fori_loop"))
+        self.assertTrue(viable([16, 128, 128], "emit_pipeline", low_level=True))
+        self.assertTrue(viable([16, 256, 128], "unroll"))
+        self.assertFalse(viable([16, 128, 128], "unroll"))
+
+
+@onlyBackends(["pallas"])
+@skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallasPartialSlice(TestCase):
     """Static bounded slices (``[:n]`` / ``[n:]``) on untiled dims."""
 
