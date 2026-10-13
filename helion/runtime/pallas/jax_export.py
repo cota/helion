@@ -337,6 +337,7 @@ def default_pallas_jax_launcher(
     # be sliced back after the pallas_call.  ``_pallas_apply_ds_padding``
     # calls ``F.pad`` on each entry, which the adapter intercepts and
     # mirrors on the JAX side, so no JAX-side duplicate is needed here.
+    # Output-only tensors are plain meta torch.Tensors, not adapters.
     orig_shapes: dict[int, tuple[int, ...]] = {}
     if _ds_pad_dims:
         for arg_idx, _, _, _ in _ds_pad_dims:
@@ -345,6 +346,8 @@ def default_pallas_jax_launcher(
             a = args[arg_idx]
             if isinstance(a, _JaxExportTensor):
                 orig_shapes[arg_idx] = tuple(int(s) for s in a._jax_arr.shape)  # type: ignore[union-attr]
+            elif isinstance(a, torch.Tensor):
+                orig_shapes[arg_idx] = tuple(int(s) for s in a.shape)
 
         args, _ = _pallas_apply_ds_padding(args, output_indices, _ds_pad_dims)
 
