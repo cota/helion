@@ -2736,21 +2736,26 @@ def _compact_aligned_window_block_spec(
     An output window (``num_work_ref`` given) ends at ``end - end % sublane``
     instead (except on the last work item) because ``ordered_carry`` holds each
     owner's partial last sublane tile for the next work item to fold and write.
+
+    The row math is masks (``sublane`` is a power of two): Mosaic expands a
+    signed ``//`` or ``%`` into about five scalar ops, and the pipeline
+    evaluates these index maps several times per work item.
     """
     from jax.experimental import pallas as pl
     import jax.numpy as jnp
 
     rows = int(t.shape[0])  # type: ignore[attr-defined]
     ndim = int(t.ndim)  # type: ignore[attr-defined]
+    assert sublane & (sublane - 1) == 0, sublane
 
     def index_map(wid: object) -> tuple[object, ...]:
         start = start_ref[wid]  # type: ignore[index]
         end = start + extent_ref[wid]  # type: ignore[index]
-        lo = start - start % sublane
-        hi = (end + sublane - 1) // sublane * sublane
+        lo = start & -sublane
+        hi = (end + sublane - 1) & -sublane
         if num_work_ref is not None:
             last = wid == num_work_ref[0] - 1  # type: ignore[index]
-            hi = jnp.where(last, hi, end - end % sublane)
+            hi = jnp.where(last, hi, end & -sublane)
         hi = jnp.minimum(hi, rows)
         lo = pl.multiple_of(lo, sublane)
         return (pl.ds(lo, hi - lo), *(jnp.int32(0) for _ in range(ndim - 1)))

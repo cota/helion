@@ -33,6 +33,44 @@ if TYPE_CHECKING:
     from helion.runtime.config import Config
 
 
+# Row arithmetic on sublane multiples.  Sublane tilings are powers of two, so
+# each helper below emits one shift or mask, with the same floor semantics as
+# Python's ``//`` and ``%`` for every int32 (two's complement).  Mosaic instead
+# expands a signed ``//`` or ``%`` into about five scalar ops of sign fix-up,
+# and a compact work item evaluates such expressions in its body and in each
+# window's index map, so they add up to much of a small work item's time.
+
+
+def _is_power_of_two(m: int) -> bool:
+    return m > 0 and m & (m - 1) == 0
+
+
+def round_down_code(expr: str, m: int) -> str:
+    """Code for ``expr - expr % m``: ``expr`` rounded down to a multiple of m."""
+    if _is_power_of_two(m):
+        return f"(({expr}) & {-m})"
+    return f"(({expr}) - ({expr}) % {m})"
+
+
+def round_up_code(expr: str, m: int) -> str:
+    """Code for ``(expr + m - 1) // m * m``: rounded up to a multiple of m."""
+    return round_down_code(f"({expr}) + {m - 1}", m)
+
+
+def floor_div_code(expr: str, m: int) -> str:
+    """Code for ``expr // m``."""
+    if _is_power_of_two(m):
+        return f"(({expr}) >> {m.bit_length() - 1})"
+    return f"(({expr}) // {m})"
+
+
+def floor_mod_code(expr: str, m: int) -> str:
+    """Code for ``expr % m``."""
+    if _is_power_of_two(m):
+        return f"(({expr}) & {m - 1})"
+    return f"(({expr}) % {m})"
+
+
 def aligned_window_sublane(env: CompileEnvironment) -> int | None:
     """Strictest float sublane across all host tensors, including unused ones."""
     from helion._compiler.host_function import HostFunction
@@ -439,12 +477,14 @@ def emit_carry_store(
     # Parenthesized: under compact_worklist the bounds are metadata expressions
     # (``begin_ref[_wid] + extent_ref[_wid]``), not names.
     begin, end = f"({rec.begin_var})", f"({rec.end_var})"
-    a_start = f"({begin} - {begin} % {S})"
-    a_end = f"(({end} + {S} - 1) // {S} * {S})"
+    a_start = round_down_code(begin, S)
+    a_end = round_up_code(end, S)
     # TODO(tcombes): assumes contiguous group offsets; a gap folds a stale carry.
-    fold_guard = f"(({row_off} == {a_start}) & ({begin} % {S} != 0))"
-    save_guard = f"(({row_off} + {block_row} >= {a_end}) & ({end} % {S} != 0))"
-    col_sub = f"pl.multiple_of(({col_off}) // {block_col} * {S}, {S})"
+    fold_guard = f"(({row_off} == {a_start}) & ({floor_mod_code(begin, S)} != 0))"
+    save_guard = (
+        f"(({row_off} + {block_row} >= {a_end}) & ({floor_mod_code(end, S)} != 0))"
+    )
+    col_sub = f"pl.multiple_of({floor_div_code(col_off, block_col)} * {S}, {S})"
     carry_slice = f"{carry}[pl.ds({col_sub}, {S}), :]"
     # Group's last row block: S-aligned, within [0, block_row - S].  Read through
     # the store's column index: the ref may hold more columns than one tile.

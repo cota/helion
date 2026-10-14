@@ -55,6 +55,10 @@ from .dma import is_tpu_dma_aligned_shape
 from .memory_access import MEMORY_ACCESS_META
 from .memory_access import MemoryAccess
 from .memory_access import MemoryAccessKind
+from .ordered_carry import floor_div_code
+from .ordered_carry import floor_mod_code
+from .ordered_carry import round_down_code
+from .ordered_carry import round_up_code
 from .tensorcore_plan import DmaAccessPlan
 from .tensorcore_plan import build_dma_access_candidates
 
@@ -1763,13 +1767,14 @@ def _codegen_bucketed_compact_tile(state: CodegenState) -> None:
         setattr(fn, name, value)
 
     begin_ref, extent_ref = (f"{name}_ref" for name in compact_ref_names(plan))
-    live = f"{begin_ref}[_wid] % {env.compact_worklist_sublane} + {extent_ref}[_wid]"
+    sublane_rows = floor_mod_code(f"{begin_ref}[_wid]", env.compact_worklist_sublane)
+    live = f"{sublane_rows} + {extent_ref}[_wid]"
     for fn_def in branch_defs:
         state.add_statement(fn_def)
     branches = ", ".join(fn_def.name for fn_def in branch_defs)
     state.add_statement(
         statement_from_string(
-            f"lax.switch(jnp.minimum(({live} - 1) // {bucket}, "
+            f"lax.switch(jnp.minimum({floor_div_code(f'{live} - 1', bucket)}, "
             f"{len(branch_defs) - 1}), [{branches}])"
         )
     )
@@ -2069,8 +2074,8 @@ def _compute_grid_and_block_sizes(
             # Aligned-enclosing span: ceil(end/S)*S - floor(begin/S)*S (0 when empty).
             begin, end = _get_loop_begin_and_end(state, i)
             sublane = aligned_tiles[block_id]
-            a_start = f"(({begin}) - ({begin}) % {sublane})"
-            a_end = f"((({end}) + {sublane} - 1) // {sublane} * {sublane})"
+            a_start = round_down_code(begin, sublane)
+            a_end = round_up_code(end, sublane)
             numel_expr = f"jnp.where(({end}) > ({begin}), {a_end} - {a_start}, 0)"
         else:
             numel_expr = _get_loop_numel(state, i)
@@ -2102,7 +2107,7 @@ def _pallas_loop_begin_and_step_exprs(
         if block_ids[i] in aligned_tiles:
             # Align the tile begin DOWN to the sublane (aligned-enclosing).
             sublane = aligned_tiles[block_ids[i]]
-            begin_expr = f"(({begin_expr}) - ({begin_expr}) % {sublane})"
+            begin_expr = round_down_code(begin_expr, sublane)
         if _loop_dim_steps_by_block(state, i):
             iter_step_expr = block_size_vars[i]
             slice_size_expr = block_size_vars[i]
@@ -2494,7 +2499,7 @@ def _setup_inner_loop_masks(
                 # mask both ends.  The relative offset is measured from a_start.
                 sublane = aligned_tiles[bid]
                 begin, end = _get_loop_begin_and_end(state, i)
-                a_start = f"(({begin}) - ({begin}) % {sublane})"
+                a_start = round_down_code(begin, sublane)
                 mask_var = strategy.fn.new_var(f"mask_{bid}", dce=True)  # pyrefly: ignore[missing-attribute]
                 strategy.mask_vars[bid] = mask_var  # pyrefly: ignore[missing-attribute]
                 needs_explicit = True

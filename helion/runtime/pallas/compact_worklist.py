@@ -109,13 +109,21 @@ def fill_owner_tiles(
     Splits ``[base, base + length)`` at ``(base - base % sublane) + j * block``
     (with ``block`` a multiple of ``sublane``) so each tile's ``sublane``-aligned
     window spans at most ``block`` rows.  An empty owner adds no tile.
+
+    Power-of-two divisors become shifts and masks (same floor semantics):
+    Mosaic expands a signed ``//`` or ``%`` into about five scalar ops, and
+    this runs once per owner before the pipeline starts.
     """
     import jax
     import jax.numpy as jnp
 
-    aligned_base = base - base % sublane
+    assert sublane & (sublane - 1) == 0, sublane
+    aligned_base = base & -sublane
     end = base + length
-    count = jnp.where(length > 0, (end - aligned_base + block - 1) // block, 0)
+    rows = end - aligned_base + block - 1
+    pow2 = block & (block - 1) == 0
+    tiles = rows >> (block.bit_length() - 1) if pow2 else rows // block
+    count = jnp.where(length > 0, tiles, 0)
 
     def tile(j: Array, carry: int) -> int:
         aligned_start = aligned_base + j * block

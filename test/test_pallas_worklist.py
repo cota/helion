@@ -1828,8 +1828,8 @@ class TestDenseInnerLoopWorklist(unittest.TestCase):
         bound = self._bound()
         code = bound.to_triton_code(_worklist_config([64, 256, 128], bucket_rows=16))
         self.assertIn(
-            "lax.switch(jnp.minimum((m_begin_ref[_wid] % 16 + m_extent_ref[_wid]"
-            " - 1) // 16, 3), [_rows_16, _rows_32, _rows_48, _rows_64])",
+            "lax.switch(jnp.minimum((m_begin_ref[_wid] & 15) + m_extent_ref[_wid]"
+            " - 1 >> 4, 3), [_rows_16, _rows_32, _rows_48, _rows_64])",
             code,
         )
         tree = ast.parse(code)
@@ -1882,6 +1882,31 @@ class TestDenseInnerLoopWorklist(unittest.TestCase):
         with self.assertRaisesRegex(exc.InvalidConfig, "more than 16 row buckets"):
             PallasBackend._compact_worklist_bucket_rows(16, 512, 16)
         self.assertEqual(PallasBackend._compact_worklist_bucket_rows(16, 256, 16), 16)
+
+    @staticmethod
+    def _device_function(code):
+        """Source of the generated device function (``_helion_*``)."""
+        (fn,) = [
+            node
+            for node in ast.parse(code).body
+            if isinstance(node, ast.FunctionDef) and node.name.startswith("_helion_")
+        ]
+        return ast.unparse(fn)
+
+    def test_row_math_is_shifts_and_masks(self):
+        # The sublane is a power of two, so the body's row arithmetic is shifts
+        # and masks: Mosaic expands a signed % or // into about five scalar ops.
+        bound = self._bound()
+        for block, bucket in ((32, 0), (64, 16)):
+            with self.subTest(block=block, bucket=bucket):
+                body = self._device_function(
+                    bound.to_triton_code(
+                        _worklist_config([block, 256, 128], bucket_rows=bucket)
+                    )
+                )
+                self.assertNotRegex(body, r"%|//")
+                self.assertIn("& -16", body)
+                self.assertIn("& 15", body)
 
     @staticmethod
     def _launcher_call(code):
@@ -2094,6 +2119,7 @@ class TestFillOwnerTiles(unittest.TestCase):
         for lengths, block, sublane in (
             (mixed, 16, 16),
             (mixed, 32, 16),
+            (mixed, 48, 16),
             ([7, 13, 9], 8, 8),
             ([0, 0, 0], 32, 16),
         ):
@@ -3806,6 +3832,35 @@ class TestResidentCacheAndPrepHoist(unittest.TestCase):
 
         self.assertEqual(ordered_resident_bound_arg(plan("kvo")), "kvo")
         self.assertIsNone(ordered_resident_bound_arg(plan(None)))
+
+
+@onlyBackends(["pallas"])
+class TestSublaneRowCode(unittest.TestCase):
+    """The row-math code helpers keep Python's floor semantics."""
+
+    def test_matches_python_floor_semantics(self):
+        from helion._compiler.pallas.ordered_carry import floor_div_code
+        from helion._compiler.pallas.ordered_carry import floor_mod_code
+        from helion._compiler.pallas.ordered_carry import round_down_code
+        from helion._compiler.pallas.ordered_carry import round_up_code
+
+        values = range(-70, 71)
+        for helper, reference in (
+            (round_down_code, lambda x, m: x - x % m),
+            (round_up_code, lambda x, m: (x + m - 1) // m * m),
+            (floor_div_code, lambda x, m: x // m),
+            (floor_mod_code, lambda x, m: x % m),
+        ):
+            for m in (1, 2, 16, 48):
+                code = helper("x", m)
+                with self.subTest(code=code):
+                    self.assertEqual(
+                        [eval(code, {"__builtins__": {}}, {"x": x}) for x in values],
+                        [reference(x, m) for x in values],
+                    )
+        # A power of two takes one mask or shift.
+        self.assertEqual(round_down_code("x", 16), "((x) & -16)")
+        self.assertEqual(floor_div_code("x", 16), "((x) >> 4)")
 
 
 @onlyBackends(["pallas"])
