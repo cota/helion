@@ -4010,6 +4010,49 @@ class TestCompactWindowSpec(unittest.TestCase):
             stored.extend(range(lo, lo + size))
         self.assertEqual(stored, list(range(rows)))
 
+    def test_aligned_windows_move_whole_sublane_tiles(self):
+        """A 2-D tensor whose rows are a sublane multiple is windowed in
+        ``(tiles, sublane, cols)`` slabs, one DMA per window, over the same
+        rows as the row windows above."""
+        import jax.numpy as jnp
+        from jax.experimental import pallas as pl
+
+        from helion.runtime.pallas.launcher import _compact_aligned_window_block_spec
+        from helion.runtime.pallas.launcher import compact_window_in_slabs
+
+        rows, block, sublane = 64, 32, 16
+        self.assertTrue(compact_window_in_slabs(torch.zeros(rows, 8), sublane))
+        self.assertFalse(compact_window_in_slabs(torch.zeros(61, 8), sublane))
+        self.assertFalse(compact_window_in_slabs(torch.zeros(rows, 2, 8), sublane))
+        # fill_owner_tiles' work items for owners of 5, 40, 16 and 3 rows.
+        starts = jnp.asarray([0, 5, 32, 45, 61], jnp.int32)
+        extents = jnp.asarray([5, 27, 13, 16, 3], jnp.int32)
+        num_work = jnp.asarray([5], jnp.int32)
+        t = torch.zeros(rows, 8)
+        load = _compact_aligned_window_block_spec(
+            t, block, sublane, starts, extents, None, 2
+        )
+        store = _compact_aligned_window_block_spec(
+            t, block, sublane, starts, extents, num_work, 2
+        )
+        tiles, tile_rows, cols = load.block_shape
+        self.assertIsInstance(tiles, pl.BoundedSlice)
+        self.assertEqual((tiles.block_size, tile_rows, cols), (2, sublane, 8))
+        stored = []
+        for wid in range(5):
+            start = int(starts[wid])
+            end = start + int(extents[wid])
+            window, *rest = load.index_map(wid)
+            self.assertEqual([int(i) for i in rest], [0, 0])
+            lo, size = int(window.start) * sublane, int(window.size) * sublane
+            self.assertEqual(lo, start - start % sublane)
+            self.assertEqual(lo + size, -(-end // sublane) * sublane)
+            self.assertLessEqual(size, block)
+            window = store.index_map(wid)[0]
+            lo, size = int(window.start) * sublane, int(window.size) * sublane
+            stored.extend(range(lo, lo + size))
+        self.assertEqual(stored, list(range(rows)))
+
 
 @onlyBackends(["pallas"])
 class TestZeroRowResidentPadding(unittest.TestCase):

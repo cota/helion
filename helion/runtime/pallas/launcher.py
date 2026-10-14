@@ -2718,6 +2718,25 @@ def _compact_window_block_spec(
     )
 
 
+def compact_window_in_slabs(t: object, sublane: int) -> bool:
+    """Whether a sublane-aligned compact window moves whole sublane tiles.
+
+    Then the tensor is viewed as ``(rows // sublane, sublane, cols)`` slabs and
+    windowed on the untiled slab dim, so each window transfer is one DMA.  A
+    window of a dynamic row count on the tiled row dim of ``(rows, cols)``
+    instead lowers to two DMAs (the even and the odd count of 8-row HBM
+    tiles) plus the scalar code that splits the count.
+    """
+    return int(t.ndim) == 2 and int(t.shape[0]) % sublane == 0  # type: ignore[attr-defined]
+
+
+def _slab_view(ref: object, sublane: int) -> object:
+    """``ref`` of shape ``(rows, *rest)`` viewed as ``(rows // sublane, sublane,
+    *rest)`` slabs (see ``compact_window_in_slabs``)."""
+    rows, *rest = ref.shape  # type: ignore[attr-defined]
+    return ref.reshape(rows // sublane, sublane, *rest)  # type: ignore[attr-defined]
+
+
 def _compact_aligned_window_block_spec(
     t: object,
     window: int,
@@ -2737,30 +2756,44 @@ def _compact_aligned_window_block_spec(
     instead (except on the last work item) because ``ordered_carry`` holds each
     owner's partial last sublane tile for the next work item to fold and write.
 
-    The row math is masks (``sublane`` is a power of two): Mosaic expands a
-    signed ``//`` or ``%`` into about five scalar ops, and the pipeline
-    evaluates these index maps several times per work item.
+    With ``compact_window_in_slabs`` the spec is over the slab view of ``t``.
+    The row math is shifts and masks (``sublane`` is a power of two): Mosaic
+    expands a signed ``//`` or ``%`` into about five scalar ops, and the
+    pipeline evaluates these index maps several times per work item.
     """
     from jax.experimental import pallas as pl
     import jax.numpy as jnp
 
     rows = int(t.shape[0])  # type: ignore[attr-defined]
     ndim = int(t.ndim)  # type: ignore[attr-defined]
-    assert sublane & (sublane - 1) == 0, sublane
+    assert sublane & (sublane - 1) == 0 and window % sublane == 0, (sublane, window)
+    shift = sublane.bit_length() - 1
+    slabs = compact_window_in_slabs(t, sublane)
 
     def index_map(wid: object) -> tuple[object, ...]:
         start = start_ref[wid]  # type: ignore[index]
         end = start + extent_ref[wid]  # type: ignore[index]
-        lo = start & -sublane
-        hi = (end + sublane - 1) & -sublane
+        # In sublane tiles: [lo, hi) holds rows [start, end).
+        lo = start >> shift
+        hi = (end + sublane - 1) >> shift
         if num_work_ref is not None:
             last = wid == num_work_ref[0] - 1  # type: ignore[index]
-            hi = jnp.where(last, hi, end & -sublane)
-        hi = jnp.minimum(hi, rows)
-        lo = pl.multiple_of(lo, sublane)
-        return (pl.ds(lo, hi - lo), *(jnp.int32(0) for _ in range(ndim - 1)))
+            hi = jnp.where(last, hi, end >> shift)
+        if not slabs:
+            lo = pl.multiple_of(lo << shift, sublane)
+            hi <<= shift
+        hi = jnp.minimum(hi, rows >> shift if slabs else rows)
+        return (
+            pl.ds(lo, hi - lo),
+            *(jnp.int32(0) for _ in range(ndim if slabs else ndim - 1)),
+        )
 
-    block_shape = (pl.BoundedSlice(window), *t.shape[1:])  # type: ignore[attr-defined]
+    leading = (
+        (pl.BoundedSlice(window // sublane), sublane)
+        if slabs
+        else (pl.BoundedSlice(window),)
+    )
+    block_shape = (*leading, *t.shape[1:])  # type: ignore[attr-defined]
     if buffer_count == 2:
         return pl.BlockSpec(block_shape, index_map)
     return pl.BlockSpec(
@@ -3061,13 +3094,28 @@ def _pallas_compile_compact_jit_fn(
         all_specs = list(in_specs) + out_specs_seq
         pipe_in_specs = [all_specs[p] for p in pipe_positions if p < n_inputs]
         pipe_out_specs = [all_specs[p] for p in pipe_positions if p >= n_inputs]
-        pipe_any = [io_any[p] for p in pipe_positions]
+        # Slab-windowed tensors (compact_window_in_slabs): the pipeline moves
+        # (tiles, sublane, cols) blocks of a slab view, and the kernel sees each
+        # block as the (compact_block, cols) window it was generated for.
+        slabs = {
+            p
+            for p, idx in enumerate([*tensor_arg_indices, *_output_indices])
+            if sublane
+            and idx in aligned_set
+            and compact_window_in_slabs(args[idx], sublane)
+        }
+        pipe_any = [
+            _slab_view(io_any[p], sublane) if p in slabs else io_any[p]
+            for p in pipe_positions
+        ]
 
         def pipeline_body(*block_refs: object) -> None:
             merged = list(io_any)
             for p, ref in smem_inputs.items():
                 merged[p] = ref
             for p, block in zip(pipe_positions, block_refs, strict=True):
+                if p in slabs:
+                    block = block.reshape(compact_block, *block.shape[2:])  # type: ignore[attr-defined]
                 merged[p] = block
             reordered_kernel(*metadata_smem, *merged, *kernel_scratch)  # type: ignore[operator]
 
