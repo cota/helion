@@ -1384,7 +1384,7 @@ class ConfigSpec:
             length=0,
         )
         self.pallas_worklist_buffer_count = ListOf(
-            IntegerFragment(2, 4, 2),
+            IntegerFragment(2, 8, 2),
             length=0,
         )
         self.epilogue_subtile_candidate_enabled: bool = False
@@ -4871,12 +4871,12 @@ class ConfigSpec:
                 not isinstance(values, list)
                 or len(values) != expected
                 or any(
-                    type(value) is not int or not 2 <= value <= 4 for value in values
+                    type(value) is not int or not 2 <= value <= 8 for value in values
                 )
             ):
                 raise InvalidConfig(
                     "pallas_worklist_buffer_count must be a list containing one "
-                    "buffer count (2 to 4) per input tensor "
+                    "buffer count (2 to 8) per input tensor "
                     f"(expected {expected}, got {values!r})"
                 )
             if expected == 0:

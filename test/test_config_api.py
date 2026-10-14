@@ -87,6 +87,7 @@ from helion._testing import skipIfXPU
 from helion._testing import skipUnlessCuteAvailable
 from helion.autotuner.config_fragment import BooleanFragment
 from helion.autotuner.config_fragment import EnumFragment
+from helion.autotuner.config_fragment import IntegerFragment
 from helion.autotuner.config_fragment import ListOf
 from helion.autotuner.config_fragment import PowerOfTwoFragment
 from helion.autotuner.config_spec import ConfigSpec
@@ -380,7 +381,7 @@ class TestPallasWorklistBufferCountConfig(TestCase):
 
     def test_rejects_invalid_explicit_lists(self) -> None:
         spec = self._config_spec(2)
-        for value in ((2, 3), [3], [2, True], [1, 2], [5, 2]):
+        for value in ((2, 3), [3], [2, True], [1, 2], [9, 2]):
             with self.subTest(value=value), self.assertRaises(exc.InvalidConfig):
                 spec.normalize(
                     helion.Config.from_dict(
@@ -390,6 +391,19 @@ class TestPallasWorklistBufferCountConfig(TestCase):
                         }
                     )
                 )
+
+    def test_counts_up_to_8_are_accepted_and_searched(self) -> None:
+        spec = self._config_spec(2)
+        for value in ([8, 5], [2, 8]):
+            with self.subTest(value=value):
+                config = helion.Config(
+                    pallas_worklist_grouping=1, pallas_worklist_buffer_count=value
+                )
+                spec.normalize(config)
+                self.assertEqual(config.pallas_worklist_buffer_count, value)
+        inner = spec.pallas_worklist_buffer_count.inner
+        assert isinstance(inner, IntegerFragment)
+        self.assertEqual((inner.low, inner.high, inner.default()), (2, 8, 2))
 
 
 @onlyBackends(["triton", "cute"])

@@ -111,7 +111,7 @@ class Config(Mapping[str, object]):
                 each input tensor. Tensors without an existing DMA route use the
                 ordinary path.
             pallas_worklist_buffer_count: Pallas-only pipeline buffer count (2 to
-                4) for each input tensor of a compact-worklist kernel
+                8) for each input tensor of a compact-worklist kernel
                 (``pallas_worklist_grouping`` 1 or 2).  Inputs the worklist
                 pipeline does not prefetch (e.g. SMEM offsets) ignore it.
             load_eviction_policies: Eviction policies for load operations. A single
