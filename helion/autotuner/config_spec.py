@@ -870,6 +870,7 @@ _BASE_BACKEND_TUNABLE_KEYS: frozenset[str] = frozenset(
         "num_ctas",
         "occupancy",
         "pallas_worklist_grouping",
+        "pallas_worklist_bucket_rows",
         "pallas_loop_type",
         "pallas_emit_pipeline_group_size",
         "pallas_use_low_level_scheduler",
@@ -1090,6 +1091,8 @@ VALID_KEYS: frozenset[str] = frozenset(
 AUTOTUNED_PALLAS_LOOP_TYPES = ("emit_pipeline", "unroll", "fori_loop")
 VALID_PALLAS_LOOP_TYPES = AUTOTUNED_PALLAS_LOOP_TYPES
 VALID_PALLAS_WORKLIST_GROUPINGS = (0, 1, 2)
+# pallas_worklist_bucket_rows values the autotuner searches (0: no row buckets).
+AUTOTUNED_PALLAS_WORKLIST_BUCKET_ROWS = (0, 16, 32, 64)
 VALID_PID_TYPES = (
     "flat",
     "xyz",
@@ -4884,6 +4887,19 @@ class ConfigSpec:
         else:
             config.pop("pallas_worklist_buffer_count", None)
         if (
+            self.supports_config_key("pallas_worklist_bucket_rows")
+            and config.get("pallas_worklist_grouping") == 1
+            and "pallas_worklist_bucket_rows" in config
+        ):
+            value = config["pallas_worklist_bucket_rows"]
+            if type(value) is not int or value < 0:
+                raise InvalidConfig(
+                    "pallas_worklist_bucket_rows must be a non-negative int "
+                    f"(0 for no row buckets), got {value!r}"
+                )
+        else:
+            config.pop("pallas_worklist_bucket_rows", None)
+        if (
             self.supports_config_key("pallas_pre_broadcast")
             and self.has_pallas_inner_loops
             and config.get("pallas_loop_type") not in ("fori_loop", "emit_pipeline")
@@ -6070,6 +6086,10 @@ class ConfigSpec:
                     fields["pallas_worklist_grouping"] = EnumFragment(
                         choices=VALID_PALLAS_WORKLIST_GROUPINGS
                     )
+                    if self.supports_config_key("pallas_worklist_bucket_rows"):
+                        fields["pallas_worklist_bucket_rows"] = EnumFragment(
+                            choices=AUTOTUNED_PALLAS_WORKLIST_BUCKET_ROWS
+                        )
                     if (
                         self.supports_config_key("pallas_worklist_buffer_count")
                         and self.pallas_worklist_buffer_count.length > 0

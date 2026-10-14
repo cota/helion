@@ -406,6 +406,38 @@ class TestPallasWorklistBufferCountConfig(TestCase):
         self.assertEqual((inner.low, inner.high, inner.default()), (2, 8, 2))
 
 
+class TestPallasWorklistBucketRowsConfig(TestCase):
+    def test_kept_only_with_grouping_one(self) -> None:
+        spec = ConfigSpec(backend=PallasBackend())
+        config = helion.Config(
+            pallas_worklist_grouping=1, pallas_worklist_bucket_rows=32
+        )
+        spec.normalize(config)
+        self.assertEqual(config.pallas_worklist_bucket_rows, 32)
+        for config in (
+            helion.Config(pallas_worklist_bucket_rows=32),
+            helion.Config(pallas_worklist_grouping=0, pallas_worklist_bucket_rows=32),
+            helion.Config(pallas_worklist_grouping=2, pallas_worklist_bucket_rows=32),
+        ):
+            with self.subTest(config=config):
+                spec.normalize(config)
+                self.assertNotIn("pallas_worklist_bucket_rows", config)
+                self.assertEqual(config.pallas_worklist_bucket_rows, 0)
+
+    def test_rejects_invalid_values(self) -> None:
+        spec = ConfigSpec(backend=PallasBackend())
+        for value in (-16, True, 16.0, "16"):
+            with self.subTest(value=value), self.assertRaises(exc.InvalidConfig):
+                spec.normalize(
+                    helion.Config.from_dict(
+                        {
+                            "pallas_worklist_grouping": 1,
+                            "pallas_worklist_bucket_rows": value,
+                        }
+                    )
+                )
+
+
 @onlyBackends(["triton", "cute"])
 class TestConfigAPI(TestCase):
     def test_num_sm_multiplier_explicit_values_and_search_space(self) -> None:

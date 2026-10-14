@@ -13,6 +13,7 @@ corresponding checkpoints land.
 from __future__ import annotations
 
 import ast
+import re
 import types
 import unittest
 from unittest.mock import patch
@@ -22,6 +23,7 @@ import torch
 
 import helion
 from helion import exc
+from helion._compiler.backend import PallasBackend
 from helion._compiler.pallas.compact_worklist import Axis
 from helion._compiler.pallas.compact_worklist import CompactWorklistPlan
 from helion._compiler.pallas.compact_worklist import TensorPolicy
@@ -821,12 +823,17 @@ def _offsets(lengths):
 
 
 def _worklist_config(
-    block_sizes: list[int], *, loop_type: str = "unroll", grouping: int = 1
+    block_sizes: list[int],
+    *,
+    loop_type: str = "unroll",
+    grouping: int = 1,
+    bucket_rows: int = 0,
 ) -> helion.Config:
     return helion.Config(
         block_sizes=block_sizes,
         pallas_loop_type=loop_type,
         pallas_worklist_grouping=grouping,
+        **({"pallas_worklist_bucket_rows": bucket_rows} if bucket_rows else {}),
     )
 
 
@@ -1162,6 +1169,9 @@ class TestDetectAndGating(unittest.TestCase):
         choices = loop_type_field.choices
         self.assertEqual(choices, ("fori_loop", "emit_pipeline", "unroll"))
         self.assertEqual(grouping_field.choices, (0, 1, 2))
+        bucket_field = fields["pallas_worklist_bucket_rows"]
+        self.assertIsInstance(bucket_field, EnumFragment)
+        self.assertEqual(bucket_field.choices, (0, 16, 32, 64))
         self.assertEqual(list(bk.env.config_spec.grid_block_ids), [0])
 
     def test_gating_absent_for_non_jagged(self):
@@ -1170,6 +1180,7 @@ class TestDetectAndGating(unittest.TestCase):
         # No inner Pallas loops -> no pallas_loop_type field at all.
         self.assertNotIn("pallas_loop_type", fields)
         self.assertNotIn("pallas_worklist_grouping", fields)
+        self.assertNotIn("pallas_worklist_bucket_rows", fields)
 
     def test_clean_region_is_not_an_autotuner_field(self):
         offsets = _offsets([16, 16, 16, 16])
@@ -1810,6 +1821,68 @@ class TestDenseInnerLoopWorklist(unittest.TestCase):
         default = bound.to_triton_code(_worklist_config([32, 256, 128]))
         self.assertNotIn("_compact_buffer_counts", default)
 
+    def test_row_buckets_switch_on_the_live_rows(self):
+        # One compact body per multiple of the bucket, each loading, multiplying
+        # and storing only its own rows of the window; lax.switch runs the
+        # smallest that covers the work item's live rows.
+        bound = self._bound()
+        code = bound.to_triton_code(_worklist_config([64, 256, 128], bucket_rows=16))
+        self.assertIn(
+            "lax.switch(jnp.minimum((m_begin_ref[_wid] % 16 + m_extent_ref[_wid]"
+            " - 1) // 16, 3), [_rows_16, _rows_32, _rows_48, _rows_64])",
+            code,
+        )
+        tree = ast.parse(code)
+        sizes = {
+            node.targets[0].id: ast.literal_eval(node.value.args[0])
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id.startswith("_BLOCK_SIZE_")
+            and isinstance(node.value, ast.Call)
+        }
+        branches = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name.startswith("_rows_")
+        ]
+        self.assertEqual(len(branches), 4)
+        for branch in branches:
+            rows = int(branch.name.removeprefix("_rows_"))
+            source = ast.unparse(branch)
+            with self.subTest(rows=rows):
+                (load,) = re.findall(r"lhs\[pl\.ds\(0, (_BLOCK_SIZE_\d+)\)", source)
+                (store,) = re.findall(r"out\[pl\.ds\(0, (_BLOCK_SIZE_\d+)\)", source)
+                self.assertEqual((sizes[load], sizes[store]), (rows, rows))
+        # Every branch folds and saves through the one carry scratch.
+        self.assertEqual(code.count("_scratch_shapes=[((16, 256)"), 1)
+
+        # No bucket, or one of the whole block, keeps the single body.
+        for bucket in (0, 64, 128):
+            with self.subTest(bucket=bucket):
+                other = bound.to_triton_code(
+                    _worklist_config([64, 256, 128], bucket_rows=bucket)
+                )
+                self.assertNotIn("lax.switch", other)
+                self.assertNotIn("_rows_", other)
+
+    def test_row_buckets_must_tile_the_block_in_sublanes(self):
+        bound = self._bound()
+        for bucket in (8, 48):
+            with (
+                self.subTest(bucket=bucket),
+                self.assertRaisesRegex(
+                    exc.InvalidConfig,
+                    "must be a multiple of the sublane 16 and divide the block 64",
+                ),
+            ):
+                bound.to_triton_code(
+                    _worklist_config([64, 256, 128], bucket_rows=bucket)
+                )
+        with self.assertRaisesRegex(exc.InvalidConfig, "more than 16 row buckets"):
+            PallasBackend._compact_worklist_bucket_rows(16, 512, 16)
+        self.assertEqual(PallasBackend._compact_worklist_bucket_rows(16, 256, 16), 16)
+
     @staticmethod
     def _launcher_call(code):
         """The tensor args (as source) and keywords of the ``_launcher`` call."""
@@ -1874,6 +1947,8 @@ class TestDenseInnerLoopNumerics(unittest.TestCase):
         extra_fill=None,
         buffer_counts=None,
         kernel=_grouped_gemm_kernel,
+        blocks=(16, 32),
+        bucket_rows=0,
     ):
         offsets = _offsets(lengths)
         total = int(offsets[-1])
@@ -1884,14 +1959,17 @@ class TestDenseInnerLoopNumerics(unittest.TestCase):
         rhs = torch.randn(len(lengths), 128, 256, dtype=torch.bfloat16)
         ref = _eager_grouped_gemm(lhs, rhs, offsets)
         args = (lhs.to(DEVICE), rhs.to(DEVICE), offsets.to(DEVICE))
-        for block in (16, 32):
+        for block in blocks:
             with self.subTest(block=block):
-                config = dict(_worklist_config([block, 256, 128]))
+                config = dict(
+                    _worklist_config([block, 256, 128], bucket_rows=bucket_rows)
+                )
                 if buffer_counts is not None:
                     config["pallas_worklist_buffer_count"] = buffer_counts
                 code, out = code_and_output(kernel, args, **config)
                 self.assertIn("_compact_fill_worklist=_fill_worklist", code)
                 self.assertNotIn("mask", TestDenseInnerLoopWorklist._lhs_load(code))
+                self.assertEqual("lax.switch(" in code, 0 < bucket_rows < block)
                 torch.testing.assert_close(out[:total].cpu(), ref, rtol=2e-2, atol=2e-2)
 
     def test_empty_owners(self):
@@ -1921,6 +1999,33 @@ class TestDenseInnerLoopNumerics(unittest.TestCase):
 
     def test_buffer_counts(self):
         self._check([5, 40, 3, 30, 70], buffer_counts=[3, 4, 2])
+
+    def test_row_buckets(self):
+        # Work items of 1..block live rows, starting at aligned and unaligned
+        # rows, run every branch: tiny owners inside one sublane tile, owners
+        # straddling bucket and block boundaries, empty owners, an owner of
+        # several full blocks.
+        for lengths in (
+            [5, 40, 3, 30, 70],
+            [0, 21, 0, 0, 11, 0],
+            [1, 2, 3, 1],
+            [150, 3, 64, 17],
+        ):
+            with self.subTest(lengths=lengths):
+                self._check(lengths, blocks=(32, 64, 128), bucket_rows=16)
+        self._check([150, 3, 64, 17], blocks=(128,), bucket_rows=32)
+
+    def test_row_buckets_keep_unowned_nan_rows_out(self):
+        for kernel in (_grouped_gemm_kernel, _grouped_gemm_dot_kernel):
+            with self.subTest(kernel=kernel.fn.__name__):
+                self._check(
+                    [5, 0, 20, 9],
+                    extra_rows=19,
+                    extra_fill=float("nan"),
+                    kernel=kernel,
+                    blocks=(64,),
+                    bucket_rows=16,
+                )
 
 
 @skipUnlessPallas("fill_owner_tiles writes SMEM refs inside a Pallas kernel")
