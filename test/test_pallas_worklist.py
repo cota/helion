@@ -1908,6 +1908,33 @@ class TestDenseInnerLoopWorklist(unittest.TestCase):
                 self.assertIn("& -16", body)
                 self.assertIn("& 15", body)
 
+    def test_one_tile_window_carries_at_offset_zero(self):
+        # A 16-row window (or one bucketed by 16) knows the work item's last
+        # sublane tile statically (offset block_row - 16); an unbucketed larger
+        # window finds it from a_end - 16 - a_start at run time.  Every compact
+        # window covers one work item's [a_start, a_end), so none needs a
+        # per-tile row_off comparison.
+        bound = self._bound()
+        one_tile = self._device_function(
+            bound.to_triton_code(_worklist_config([16, 256, 128]))
+        )
+        bucketed = self._device_function(
+            bound.to_triton_code(_worklist_config([64, 256, 128], bucket_rows=16))
+        )
+        two_tiles = self._device_function(
+            bound.to_triton_code(_worklist_config([32, 256, 128]))
+        )
+        save = r"carry\[[^\n]*\] = jnp\.where\([^\n]*, out\[pl\.ds\(({}), 16\)"
+        self.assertRegex(one_tile, save.format("0"))
+        self.assertNotIn("offset_1", one_tile)
+        for off in (0, 16, 32, 48):
+            self.assertRegex(bucketed, save.format(str(off)))
+        self.assertRegex(
+            two_tiles,
+            save.format(r"pl\.multiple_of\([^\n]* - 16 - \([^\n]*\), 16\)"),
+        )
+        self.assertNotIn("offset_1", two_tiles)
+
     @staticmethod
     def _launcher_call(code):
         """The tensor args (as source) and keywords of the ``_launcher`` call."""
