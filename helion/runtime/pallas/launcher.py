@@ -1521,6 +1521,31 @@ def _pallas_apply_ds_padding(
     return tuple(args_list), orig_output_tensors
 
 
+def _pallas_spec_args(
+    args: tuple[object, ...],
+    output_indices: list[int],
+    ds_pad_dims: list[tuple[int, int, int, int]] | None,
+) -> tuple[object, ...]:
+    """Storage-free stand-ins for ``args`` to build a launcher's specs from.
+
+    The jit_fn a launcher caches on its kernel closes over the args its specs
+    were built from, and a generated kernel lives as long as the process
+    (PyCodeCache keeps its module), so a real tensor here would keep its
+    device buffer alive: for a ds-padded tensor, a padded copy per compiled
+    config. Meta tensors carry the shape, strides and dtype that building the
+    specs reads, own no storage, and pad without allocating.
+    """
+    spec_args = tuple(
+        torch.empty_strided(a.size(), a.stride(), dtype=a.dtype, device="meta")
+        if isinstance(a, torch.Tensor)
+        else a
+        for a in args
+    )
+    if ds_pad_dims:
+        spec_args, _ = _pallas_apply_ds_padding(spec_args, output_indices, ds_pad_dims)
+    return spec_args
+
+
 def _build_matmul_dot_general_jit_fn(
     spec: dict[str, object],
 ) -> Callable[..., object]:
@@ -2405,11 +2430,10 @@ def _pallas_install_launcher_cache(
 
     output_indices = _output_indices if _output_indices is not None else []
 
-    # Build the pallas specs from ds-padded shapes on a throwaway copy so
-    # ``args`` stays unpadded for the shared invoke below to pad fresh.
-    spec_args = args
-    if _ds_pad_dims:
-        spec_args, _ = _pallas_apply_ds_padding(args, output_indices, _ds_pad_dims)
+    # Build the pallas specs from ds-padded stand-ins so ``args`` stays
+    # unpadded for the shared invoke below to pad fresh, and so the cached
+    # jit_fn pins no device memory (see ``_pallas_spec_args``).
+    spec_args = _pallas_spec_args(args, output_indices, _ds_pad_dims)
 
     _pallas_check_dtypes(spec_args)
 
@@ -3293,9 +3317,7 @@ def _pallas_install_compact_launcher_cache(
         _ensure_torch_tpu_cpu_export_info()
     output_indices = _output_indices if _output_indices is not None else []
 
-    spec_args = args
-    if _ds_pad_dims:
-        spec_args, _ = _pallas_apply_ds_padding(args, output_indices, _ds_pad_dims)
+    spec_args = _pallas_spec_args(args, output_indices, _ds_pad_dims)
     _pallas_check_dtypes(spec_args)
 
     result = _pallas_compile_compact_jit_fn(

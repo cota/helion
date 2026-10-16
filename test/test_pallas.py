@@ -3534,6 +3534,55 @@ class TestPallas(TestCase):
             f"{(reference.float() - baseline_result.float()).abs().max().item()}).",
         )
 
+    def test_pallas_launcher_cache_does_not_pin_padded_argument_copies(self) -> None:
+        """The launcher cache keeps no ds-padded copy of an argument alive.
+
+        The launcher built its specs from ds-padded copies of the arguments and
+        the jit_fn it caches on the kernel closed over them. A generated kernel
+        lives as long as the process, so each autotune candidate that padded an
+        input kept its own padded copy (1.9 GiB per candidate for a 1.4 GiB
+        grouped-GEMM weight) until HBM ran out.
+        """
+        import gc
+        from unittest.mock import patch
+        import weakref
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def scale_rows(x: torch.Tensor, r: torch.Tensor) -> torch.Tensor:
+            m, _ = x.shape
+            out = torch.empty_like(x)
+            for _g in hl.grid(1):
+                for mb_cta in hl.tile(4, m, block_size=8):
+                    for mb in hl.tile(mb_cta.begin, mb_cta.end):
+                        out[mb, :] = x[mb, :] * r[mb, :]
+            return out
+
+        x = torch.randn(64, 128, device=DEVICE, dtype=torch.float32)
+        r = torch.randn(64, 1, device=DEVICE, dtype=torch.float32)
+        fn = scale_rows.bind((x, r)).compile_config(
+            helion.Config(block_sizes=[8], pallas_loop_type="fori_loop")
+        )
+        padded: list[weakref.ref[torch.Tensor]] = []
+        pad = torch.nn.functional.pad
+
+        def recording_pad(t: torch.Tensor, widths: list[int]) -> torch.Tensor:
+            out = pad(t, widths)
+            if out.device.type != "meta":
+                padded.append(weakref.ref(out))
+            return out
+
+        with patch.object(torch.nn.functional, "pad", recording_pad):
+            result = fn(x, r)
+        torch.testing.assert_close(result[4:], (x * r)[4:])
+        self.assertTrue(padded, "expected the launcher to ds-pad the arguments")
+        del result
+        gc.collect()
+        self.assertEqual(
+            [ref().shape for ref in padded if ref() is not None],
+            [],
+            "padded argument copies outlived the call",
+        )
+
     def test_pallas_autotuner_final_pick_picks_true_best_on_noisy_initial_rank(
         self,
     ) -> None:
