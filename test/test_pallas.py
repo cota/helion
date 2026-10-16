@@ -3904,6 +3904,58 @@ class TestPallas(TestCase):
             f"identical jit_fns should give a near-zero paired delta; got {delta_micros!r}",
         )
 
+    def test_wall_clock_benches_time_failed_executions_as_inf(self) -> None:
+        """A run whose device execution failed is never timed as a success.
+
+        TorchTPU attaches an asynchronous execution failure (e.g.
+        RESOURCE_EXHAUSTED) only to the run's outputs, and the device-wide
+        sync returns normally, so the final verification timed such runs as
+        fast successes and picked a config 1000x slower than the others.
+        """
+        from unittest.mock import patch
+
+        from helion.autotuner import benchmarking
+
+        failed_output = object()
+        calls = {"ok": 0, "failing": 0}
+
+        def ok() -> object:
+            calls["ok"] += 1
+            return None
+
+        def failing() -> object:
+            calls["failing"] += 1
+            return failed_output
+
+        with patch.object(
+            benchmarking,
+            "_execution_failed",
+            side_effect=lambda output: output is failed_output,
+        ):
+            timings = benchmarking.interleaved_bench_generic([ok, failing], repeat=5)
+            self.assertTrue(math.isfinite(timings[0]), timings)
+            self.assertEqual(timings[1], math.inf)
+            # Warmup plus the failed timed run: a failed function is not rerun.
+            self.assertEqual(calls, {"ok": 6, "failing": 2})
+
+            for probe_long_kernel in (False, True):
+                self.assertEqual(
+                    benchmarking.do_bench_generic(
+                        failing,
+                        return_mode="median",
+                        fixed_repetitions=None if probe_long_kernel else 3,
+                        probe_long_kernel=probe_long_kernel,
+                    ),
+                    math.inf,
+                )
+            self.assertTrue(
+                math.isfinite(
+                    benchmarking.do_bench_generic(
+                        ok, return_mode="median", fixed_repetitions=3
+                    )
+                )
+            )
+
     @skipIfPallasInterpret(
         "device-sync semantics need a real TPU; CPU-interpret executes synchronously"
     )
