@@ -3575,6 +3575,44 @@ class TestPallas(TestCase):
             f"{(reference.float() - baseline_result.float()).abs().max().item()}).",
         )
 
+    def test_pallas_launcher_cache_does_not_leak_padded_argument_copies(self) -> None:
+        from unittest.mock import patch
+        import weakref
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def scale_rows(x: torch.Tensor, r: torch.Tensor) -> torch.Tensor:
+            m, _ = x.shape
+            out = torch.empty_like(x)
+            for _g in hl.grid(1):
+                for outer_tile in hl.tile(4, m, block_size=8):
+                    for inner_tile in hl.tile(outer_tile.begin, outer_tile.end):
+                        out[inner_tile, :] = x[inner_tile, :] * r[inner_tile, :]
+            return out
+
+        x = torch.randn(64, 128, device=DEVICE, dtype=torch.float32)
+        r = torch.randn(64, 1, device=DEVICE, dtype=torch.float32)
+        fn = scale_rows.bind((x, r)).compile_config(
+            helion.Config(block_sizes=[8], pallas_loop_type="fori_loop")
+        )
+        padded: list[weakref.ref[torch.Tensor]] = []
+        pad = torch.nn.functional.pad
+
+        def recording_pad(t: torch.Tensor, widths: list[int]) -> torch.Tensor:
+            out = pad(t, widths)
+            if out.device.type != "meta":
+                padded.append(weakref.ref(out))
+            return out
+
+        with patch.object(torch.nn.functional, "pad", recording_pad):
+            result = fn(x, r)
+        torch.testing.assert_close(result[4:], (x * r)[4:])
+        self.assertTrue(padded, "expected the launcher to ds-pad the arguments")
+        self.assertEqual(
+            [ref().shape for ref in padded if ref() is not None],
+            [],
+            "padded argument copies outlived the call",
+        )
+
     def test_pallas_autotuner_final_pick_picks_true_best_on_noisy_initial_rank(
         self,
     ) -> None:
