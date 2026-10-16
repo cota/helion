@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import gc
 import json
 import os
 from pathlib import Path
@@ -9,6 +10,7 @@ import tempfile
 import unittest
 from unittest.mock import Mock
 from unittest.mock import patch
+import weakref
 
 import torch
 
@@ -306,6 +308,27 @@ class TestIrGraphDegradation(TestCase):
             KernelMetadata(**fields).run_id,
             KernelMetadata(**fields, _device_ir=object()).run_id,
         )
+
+
+class TestKernelSource(TestCase):
+    def test_kernel_source_does_not_keep_kernel_alive(self) -> None:
+        # Every autotune reads kernel_source(); caching it in a functools.cache
+        # on the method kept each autotuned Kernel, and every config it
+        # compiled, alive for the life of the process.
+        def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] + y[tile]
+            return out
+
+        kernel = helion.kernel(add)
+        source = kernel.kernel_source()
+        self.assertIn("def add(", source)
+        self.assertIs(kernel.kernel_source(), source)
+        kernel_ref = weakref.ref(kernel)
+        del kernel
+        gc.collect()
+        self.assertIsNone(kernel_ref())
 
 
 if __name__ == "__main__":
