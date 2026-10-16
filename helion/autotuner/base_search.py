@@ -979,10 +979,12 @@ class BaseSearch(BaseAutotuner):
                 "to accuracy checks."
             )
         if self._autotune_metrics.num_compile_failures:
+            # Not "N of num_configs_tested": a config that fails to compile is
+            # counted here but never benchmarked, so N can exceed that count.
             self.log.warning(
-                f"{self._autotune_metrics.num_compile_failures} of "
-                f"{self._autotune_metrics.num_configs_tested} configs failed due "
-                "to compile failures."
+                f"{self._autotune_metrics.num_compile_failures} configs failed to "
+                "compile or run, including configs that failed to compile and "
+                "were never benchmarked."
             )
         if self._autotune_metrics.num_worker_failures:
             self.log.warning(
